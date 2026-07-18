@@ -125,16 +125,20 @@ class STTEngine:
             )
         except Exception as exc:
             # If CUDA is unavailable at load time, fall back to CPU transparently
+            # — downshifting to the smaller CPU fallback model, because the
+            # default GPU model is unusably slow on CPU int8.
             if self._device != "cpu":
+                fallback_size = config.WHISPER_CPU_FALLBACK_MODEL or self._model_size
                 logger.warning(
-                    f"Failed to load on {self._device} ({exc}). "
-                    f"Falling back to CPU with int8 compute."
+                    f"Failed to load '{self._model_size}' on {self._device} ({exc}). "
+                    f"Falling back to CPU with int8 compute using '{fallback_size}'."
                 )
                 self._model = WhisperModel(
-                    self._model_size,
+                    fallback_size,
                     device="cpu",
                     compute_type="int8",
                 )
+                self._model_size = fallback_size
                 self._active_device = "cpu"
                 logger.success(f"Whisper '{self._model_size}' loaded on CPU (fallback).")
             else:
@@ -143,6 +147,8 @@ class STTEngine:
     def listen_and_transcribe(
         self,
         initial_silence_timeout: float = SILENCE_DURATION_S,
+        *,
+        hotwords: Optional[str] = None,
     ) -> str:
         """
         Open the microphone, record until the user stops speaking, then
@@ -155,6 +161,9 @@ class STTEngine:
                 Default = SILENCE_DURATION_S so normal first-turn behaviour is
                 unchanged.  Pass a larger value (e.g. 4-5 s) for follow-up turns
                 so the user has a natural pause to decide whether to keep talking.
+            hotwords: Optional short phrase of domain words to bias Whisper's
+                decoding toward (e.g. account labels when asking "which
+                account?"). Passed straight through to faster-whisper.
 
         Returns:
             Transcribed text as a plain stripped string.
@@ -175,7 +184,7 @@ class STTEngine:
         duration_s = len(audio_data) / SAMPLE_RATE
         logger.info(f"Recorded {duration_s:.1f}s of audio. Transcribing…")
 
-        return self._transcribe(audio_data)
+        return self._transcribe(audio_data, hotwords=hotwords)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -303,13 +312,16 @@ class STTEngine:
             return 0.0
         return math.sqrt(np.mean(samples ** 2))
 
-    def _transcribe(self, audio: np.ndarray) -> str:
+    def _transcribe(self, audio: np.ndarray, hotwords: Optional[str] = None) -> str:
         """
         Run Whisper inference on a float32 audio array.
 
         Returns the full transcription as a single stripped string.
         If a CUDA runtime library is missing (e.g. cublas64_12.dll), the model
         is transparently reloaded on CPU and inference is retried once.
+
+        `hotwords` softly biases decoding toward the given words — used when
+        the answer is drawn from a known vocabulary (account names, contacts).
         """
         def _run(model: WhisperModel) -> tuple:
             return model.transcribe(
@@ -318,6 +330,7 @@ class STTEngine:
                 beam_size=5,
                 vad_filter=True,           # skip non-speech segments automatically
                 vad_parameters={"min_silence_duration_ms": 500},
+                hotwords=hotwords,
             )
 
         try:
@@ -327,17 +340,19 @@ class STTEngine:
             # cublas64_12.dll / CUDA runtime not found — fall back to CPU
             err = str(exc).lower()
             if any(kw in err for kw in ("cublas", "cuda", "cudnn", "dll")):
+                fallback_size = config.WHISPER_CPU_FALLBACK_MODEL or self._model_size
                 logger.warning(
                     f"CUDA inference error: {exc}\n"
-                    f"Reloading model on CPU and retrying…"
+                    f"Reloading '{fallback_size}' on CPU and retrying…"
                 )
                 self._model = WhisperModel(
-                    self._model_size,
+                    fallback_size,
                     device="cpu",
                     compute_type="int8",
                 )
+                self._model_size = fallback_size
                 self._active_device = "cpu"
-                logger.success("Model reloaded on CPU.")
+                logger.success(f"Model '{fallback_size}' reloaded on CPU.")
                 segments, info = _run(self._model)
                 text = " ".join(seg.text.strip() for seg in segments).strip()
             else:
@@ -366,7 +381,7 @@ if __name__ == "__main__":
     )
 
     engine = STTEngine(
-        model_size="base",   # fast & accurate enough for testing
+        model_size=config.WHISPER_MODEL_SIZE,   # exercise the size that ships
         device=config.WHISPER_DEVICE,
         compute_type=config.WHISPER_COMPUTE_TYPE,
     )

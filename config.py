@@ -39,11 +39,17 @@ MIC_SAMPLE_RATE: int = int(os.environ.get("MIC_SAMPLE_RATE", "16000"))  # Hz
 MIC_CHANNELS: int = int(os.environ.get("MIC_CHANNELS", "1"))            # mono
 
 # ── Speech-to-Text (faster-whisper) ──────────
-# Model size: tiny | base | small | medium | large-v2 | large-v3
-WHISPER_MODEL_SIZE: str = os.environ.get("WHISPER_MODEL_SIZE", "base")
+# Model size: tiny | base | small | medium | large-v2 | large-v3 | large-v3-turbo
+# large-v3-turbo (~1.7 GB fp16) is the default: short command words ("gmail")
+# need a big model, and every target machine has a capable GPU.
+WHISPER_MODEL_SIZE: str = os.environ.get("WHISPER_MODEL_SIZE", "large-v3-turbo")
 # Device: "cuda" for GPU (RTX 5060), "cpu" as fallback
 WHISPER_DEVICE: str = os.environ.get("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE_TYPE: str = os.environ.get("WHISPER_COMPUTE_TYPE", "float16")
+# Model used when CUDA is unavailable and STT falls back to CPU (int8): the
+# large default above is seconds-per-utterance on CPU, so the fallback
+# downshifts to stay usable rather than technically-working-but-unusable.
+WHISPER_CPU_FALLBACK_MODEL: str = os.environ.get("WHISPER_CPU_FALLBACK_MODEL", "base")
 WHISPER_LANGUAGE: str = os.environ.get("WHISPER_LANGUAGE", "en")
 
 # ── Text-to-Speech (Kokoro-82M, local GPU) ───────────────────────────────────

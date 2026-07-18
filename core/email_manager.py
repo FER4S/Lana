@@ -151,6 +151,89 @@ def _truncate_for_prompt(text: str, limit: int) -> str:
     return truncate_text(text, limit)
 
 
+# ── Account-hint matching ──────────────────────────────────────────────────────
+# Spoken account names never line up with stored labels/providers exactly ("my
+# gmail account" vs the provider string "gmail_oauth"), so hint→account matching
+# is token-based, not substring. This is the ONE rule shared by the send flow and
+# every browse/deep-search account filter, so "send from Gmail" and "read my
+# Gmail" agree. Deliberately deterministic — no fuzzy/edit-distance here; that
+# lives only in the send-flow ask loop, where a wrong guess is caught by the
+# spoken readback + mandatory confirmation before anything leaves the machine.
+
+# provider → extra spoken words that should resolve to it.
+_PROVIDER_ALIASES: dict[str, tuple[str, ...]] = {
+    PROVIDER_GMAIL: ("gmail", "google"),
+    PROVIDER_IMAP: ("imap",),
+}
+
+# Dropped from a spoken hint before matching, so "my gmail account" and "the
+# gmail one" both reduce to the single meaningful token {"gmail"}. "mail"/"email"
+# are filler on purpose: they're substrings of half the candidates and would make
+# every hint match everything.
+_ACCOUNT_HINT_FILLER: frozenset[str] = frozenset({
+    "my", "the", "a", "an", "account", "accounts", "from", "email", "emails",
+    "e", "mail", "one", "please", "use", "using", "send", "it", "with", "to",
+})
+
+# Two tokens also match when one contains the other, but only when both are at
+# least this long — so "e"/"co" fragments can't match, while "gmail" still
+# matches "gmailing" and "hosting" matches "hostinger".
+_MIN_ACCOUNT_TOKEN_LEN: int = 3
+
+
+def _account_words(text: str) -> list[str]:
+    """Lowercase alphanumeric tokens of a label/hint."""
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+def account_hint_tokens(hint: str | None) -> list[str]:
+    """Meaningful tokens from a spoken account hint, filler removed."""
+    return [t for t in _account_words(hint or "") if t not in _ACCOUNT_HINT_FILLER]
+
+
+def account_candidate_tokens(account: dict) -> set[str]:
+    """The vocabulary a hint may match this account on: its label tokens, its
+    provider token, and any provider aliases (gmail/google, imap)."""
+    tokens = set(_account_words(account.get("label", "")))
+    provider = account.get("provider", "")
+    tokens.update(_account_words(provider))
+    tokens.update(_PROVIDER_ALIASES.get(provider, ()))
+    return tokens
+
+
+def account_matches_hint(account: dict, hint: str | None) -> bool:
+    """True when a spoken hint identifies this account. A hint token matches a
+    candidate token when equal, or (both >= _MIN_ACCOUNT_TOKEN_LEN) one contains
+    the other. Empty/filler-only hints match nothing (the caller treats "no
+    meaningful hint" separately)."""
+    hints = account_hint_tokens(hint)
+    if not hints:
+        return False
+    candidates = account_candidate_tokens(account)
+    for ht in hints:
+        for ct in candidates:
+            if ht == ct:
+                return True
+            if (len(ht) >= _MIN_ACCOUNT_TOKEN_LEN and len(ct) >= _MIN_ACCOUNT_TOKEN_LEN
+                    and (ht in ct or ct in ht)):
+                return True
+    return False
+
+
+def account_hotwords(accounts: list[dict]) -> str:
+    """A short comma-joined vocabulary (labels + provider aliases) to bias STT
+    toward when asking which account to send from."""
+    words: list[str] = []
+    for a in accounts:
+        label = _clean_str(a.get("label"))
+        if label and label not in words:
+            words.append(label)
+        for alias in _PROVIDER_ALIASES.get(a.get("provider", ""), ()):
+            if alias not in words:
+                words.append(alias)
+    return ", ".join(words)
+
+
 def _age_seconds(date_iso: str, now: datetime) -> float:
     """Seconds between `now` and an ISO date string. Unparseable -> 0.0
     (treated as fresh rather than silently dropped by an age filter)."""
@@ -550,20 +633,17 @@ class EmailManager:
 
     def resolve_accounts_by_hint(self, account_hint: str | None) -> list[dict]:
         """
-        Safe account views matching a spoken account name. No hint returns
-        every account, so the caller decides between "use the only one" and
-        "ask which". Same case-insensitive label-or-provider substring rule
-        get_cached_emails() applies, so "Gmail" hits the gmail_oauth provider
-        and "Hostinger" hits a label.
+        Safe account views matching a spoken account name. No meaningful hint
+        returns every account, so the caller decides between "use the only one"
+        and "ask which". Uses the shared token matcher (account_matches_hint),
+        so "Gmail", "google", "my gmail account", and "the gmail one" all hit a
+        gmail_oauth account, and "Hostinger" hits a label — the same rule the
+        cache/deep-search account filters apply, so browse and send agree.
         """
         accounts = self._store.list_safe()
-        hint = _clean_str(account_hint).lower()
-        if not hint:
+        if not account_hint_tokens(account_hint):
             return accounts
-        return [
-            a for a in accounts
-            if hint in a["label"].lower() or hint in a["provider"].lower()
-        ]
+        return [a for a in accounts if account_matches_hint(a, account_hint)]
 
     def get_accounts_context(self) -> str:
         """
@@ -1096,11 +1176,10 @@ class EmailManager:
             for entry in self._cache["accounts"].values():
                 pool.extend(entry.get("emails", []))
 
-        if account_hint:
-            hint_lower = account_hint.lower()
+        if account_hint_tokens(account_hint):
             matching_ids = {
                 a["id"] for a in safe_accounts
-                if hint_lower in a["label"].lower() or hint_lower in a["provider"].lower()
+                if account_matches_hint(a, account_hint)
             }
             pool = [e for e in pool if e["account_id"] in matching_ids]
 
@@ -1192,12 +1271,8 @@ class EmailManager:
             return emails
 
         accounts = self._store.list_all()
-        if account_hint:
-            hint_lower = account_hint.lower()
-            accounts = [
-                a for a in accounts
-                if hint_lower in a["label"].lower() or hint_lower in a["provider"].lower()
-            ]
+        if account_hint_tokens(account_hint):
+            accounts = [a for a in accounts if account_matches_hint(a, account_hint)]
 
         results: list[dict] = []
         for account in accounts:
@@ -1259,12 +1334,8 @@ class EmailManager:
         before_param = anchor.astimezone(config.TIMEZONE).date() + timedelta(days=1)
 
         accounts = self._store.list_all()
-        if account_hint:
-            hint_lower = account_hint.lower()
-            accounts = [
-                a for a in accounts
-                if hint_lower in a["label"].lower() or hint_lower in a["provider"].lower()
-            ]
+        if account_hint_tokens(account_hint):
+            accounts = [a for a in accounts if account_matches_hint(a, account_hint)]
 
         results: list[dict] = []
         for account in accounts:
@@ -1498,9 +1569,15 @@ class EmailManager:
                     "- subject_hint (string or null): a subject or topic ONLY if they "
                     "explicitly stated one (\"subject it 'Q3 budget'\", \"about the "
                     "budget\"). Do not invent one from the message.\n"
-                    "- account_hint (string or null): an account label or provider name "
-                    "ONLY if the user explicitly said which account to send from; never "
-                    "fill it in just because accounts exist.\n"
+                    "- account_hint (string or null): which connected account to send "
+                    "FROM, ONLY if the user indicated one — either by name/provider (\"my "
+                    "gmail\", \"the Hostinger one\") OR by a role that clearly maps to one "
+                    "of the connected accounts listed above (\"my work email\", \"my "
+                    "personal account\"). When it maps to a listed account, return that "
+                    "account's EXACT label from the list above; otherwise return just the "
+                    "bare provider/name word they used (\"gmail\", not \"my gmail "
+                    "account\"). Null if they did not indicate an account — never fill it "
+                    "in just because accounts exist.\n"
                     "- is_reply (true/false): true only when replying to the email shown "
                     "above. False when starting a fresh email to someone.\n\n"
                     "Extract only what was actually said. Never invent a recipient, an "

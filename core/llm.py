@@ -195,6 +195,18 @@ class LLMEngine:
             self._history.pop()
             return _FALLBACK_GENERIC
 
+    def note_interrupted_reply(self) -> None:
+        """
+        Mark the last assistant reply as cut off by the user (barge-in), so the
+        model knows the boss didn't hear the whole thing and shouldn't assume it
+        landed. No-op if the last turn isn't an assistant turn. Appended to the
+        stored text only — the spoken audio already stopped.
+        """
+        if self._history and self._history[-1]["role"] == "assistant":
+            if "[interrupted by the user]" not in self._history[-1]["content"]:
+                self._history[-1]["content"] += " … [interrupted by the user]"
+            logger.debug("Marked last assistant reply as interrupted.")
+
     def reset_history(self) -> None:
         """Clear the conversation history (e.g. on a new wake-word trigger session)."""
         self._history.clear()

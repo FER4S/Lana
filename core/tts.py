@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -75,6 +76,11 @@ class TTSEngine:
         self._speed = speed
         self._pipeline: Optional[KPipeline] = None
         self._active_device: Optional[str] = None
+        # Set by request_stop() (barge-in) to cut an in-flight utterance short.
+        # Only the speaking thread ever calls sd.stop(); another thread setting
+        # this and touching sounddevice would race the playback poll below.
+        self._stop_event: threading.Event = threading.Event()
+        self._playing: bool = False
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -117,22 +123,31 @@ class TTSEngine:
                 logger.error(f"Failed to load Kokoro-82M: {exc}")
                 raise
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str) -> bool:
         """
         Synthesise `text` to speech and play it through the default speaker.
-        Blocks until playback is complete.
+        Blocks until playback is complete OR until request_stop() is called
+        from another thread (barge-in).
 
         Args:
             text: Plain text to speak. Avoid markdown or special symbols.
+
+        Returns:
+            True if the whole utterance played to the end; False if it was
+            interrupted (barge-in) or a synthesis/playback error occurred.
         """
         if not text or not text.strip():
             logger.warning("speak() called with empty text — skipping.")
-            return
+            return True  # nothing to interrupt
 
         if self._pipeline is None:
             raise RuntimeError(
                 "TTSEngine not initialized. Call initialize() first."
             )
+
+        # A stop request left over from a previous utterance must not cancel
+        # this one — clear it at entry, before any audio is produced.
+        self._stop_event.clear()
 
         logger.info(f"Speaking: '{text[:80]}{'…' if len(text) > 80 else ''}'")
         t_start = time.monotonic()
@@ -149,13 +164,16 @@ class TTSEngine:
                 voice=self._voice,
                 speed=self._speed,
             ):
+                if self._stop_event.is_set():
+                    logger.info("TTS interrupted during synthesis.")
+                    return False
                 if result.audio is not None:
                     # Move to CPU and convert to float32 numpy for sounddevice
                     segments.append(result.audio.cpu().numpy().astype(np.float32))
 
             if not segments:
                 logger.warning("Kokoro produced no audio for the given text.")
-                return
+                return True
 
             audio = np.concatenate(segments) if len(segments) > 1 else segments[0]
 
@@ -168,18 +186,49 @@ class TTSEngine:
             )
 
             # ── Playback ──────────────────────────────────────────────────────
-            sd.play(audio, samplerate=KOKORO_SAMPLE_RATE)
-            sd.wait()  # block until speaker is done
+            # sd.wait() can't be interrupted, so poll for either completion or a
+            # barge-in stop request. Only THIS thread ever calls sd.stop().
+            self._playing = True
+            try:
+                sd.play(audio, samplerate=KOKORO_SAMPLE_RATE)
+                while True:
+                    if self._stop_event.is_set():
+                        sd.stop()
+                        logger.info("TTS interrupted during playback (barge-in).")
+                        return False
+                    stream = sd.get_stream()
+                    if stream is None or not stream.active:
+                        break  # playback finished naturally
+                    time.sleep(0.05)
+            finally:
+                self._playing = False
 
             logger.debug(f"Total speak() latency: {t_generated - t_start:.3f}s")
+            return True
 
         except Exception as exc:
             logger.error(f"TTS error: {exc}")
             sd.stop()  # ensure sounddevice isn't left in a broken state
+            return False
+
+    def request_stop(self) -> None:
+        """Ask an in-flight speak() to stop as soon as possible (barge-in).
+
+        Sets a flag only — the speaking thread notices it within one poll tick
+        and calls sd.stop() itself. Deliberately does NOT touch sounddevice from
+        the caller's thread: a cross-thread sd.stop() races the playback poll's
+        stream access and can crash PortAudio natively (the same hazard the wake
+        detector already guards with a stop lock)."""
+        self._stop_event.set()
 
     def shutdown(self) -> None:
         """Stop any ongoing playback and release resources."""
-        sd.stop()
+        # Signal first so an in-flight speak() unwinds itself; only force
+        # sd.stop() here when nothing is playing, to avoid the cross-thread race
+        # (a live speak() will stop its own stream within one poll tick).
+        self._stop_event.set()
+        if not self._playing:
+            sd.stop()
         self._pipeline = None
         logger.debug("TTSEngine shut down.")
 
@@ -206,8 +255,33 @@ if __name__ == "__main__":
     for line in test_lines:
         print(f"\nSpeaking: {line}")
         t = time.monotonic()
-        engine.speak(line)
-        print(f"Done in {time.monotonic() - t:.3f}s total")
+        completed = engine.speak(line)
+        print(f"Done in {time.monotonic() - t:.3f}s total (completed={completed})")
+
+    # ── Barge-in / cancellation self-test ──────────────────────────────────────
+    # A background thread fires request_stop() ~0.6 s into a long utterance; the
+    # speak() call must return promptly with completed=False, and the NEXT speak()
+    # must run to completion (the stop flag is cleared at entry).
+    import threading as _threading
+
+    long_line = (
+        "This is a deliberately long sentence that should take several seconds "
+        "to say out loud, so that the barge-in stop request has time to land "
+        "while the audio is still playing through the speaker."
+    )
+    print(f"\nSpeaking (will interrupt at ~0.6s): {long_line}")
+    _threading.Timer(0.6, engine.request_stop).start()
+    t = time.monotonic()
+    completed = engine.speak(long_line)
+    elapsed = time.monotonic() - t
+    print(f"Interrupted speak returned completed={completed} after {elapsed:.2f}s")
+    assert completed is False, "expected barge-in to cut the utterance short"
+    assert elapsed < 3.0, f"stop took too long to take effect ({elapsed:.2f}s)"
+
+    print("\nSpeaking (should run to completion after the interrupt):")
+    completed = engine.speak("And this line should play all the way through.")
+    assert completed is True, "stop flag was not cleared for the next utterance"
+    print("Barge-in self-test passed.")
 
     engine.shutdown()
     print("\nDone.")

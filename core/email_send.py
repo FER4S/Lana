@@ -18,10 +18,12 @@
 from __future__ import annotations
 
 import base64
+import email.utils
 import os
 import smtplib
 import ssl
 import sys
+from datetime import datetime
 from email.message import EmailMessage
 from typing import Protocol
 
@@ -31,8 +33,11 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+import imapclient
+from imapclient import IMAPClient
 from loguru import logger
 
+import config
 from core.email_accounts import PROVIDER_GMAIL, PROVIDER_IMAP
 from core.email_fetch import build_gmail_service
 
@@ -42,6 +47,20 @@ from core.email_fetch import build_gmail_service
 SMTP_DEFAULT_SSL_PORT: int = 465      # implicit TLS (SMTPS)
 SMTP_DEFAULT_STARTTLS_PORT: int = 587  # explicit TLS
 SMTP_TIMEOUT_S: float = 20.0           # the boss is waiting; fail fast, don't hang the turn
+
+# After an SMTP send, IMAP-provider accounts also save a copy to their Sent
+# folder (SMTP itself never does this — the Gmail API does, which is why only the
+# Hostinger-style path needed it). Kept shorter than SMTP_TIMEOUT_S because by
+# now the mail has already left; a slow save must not drag the spoken "Sent to X".
+SENT_APPEND_TIMEOUT_S: float = 10.0
+# The \Sent SPECIAL-USE attribute (imapclient.SENT lives in a submodule and isn't
+# re-exported at top level in 3.0.1, so the flag bytes are named here directly).
+_IMAP_SENT_FLAG: bytes = b"\\Sent"
+# Case-insensitive last-path-segment fallbacks when the server advertises no
+# \Sent folder — a superset of what find_special_folder() already tries.
+_SENT_FALLBACK_NAMES: frozenset[str] = frozenset({
+    "sent", "sent items", "sent messages", "sent mail",
+})
 
 # Subject prefix for replies. Compared case-insensitively before prepending, so
 # replying to an already-"Re: " subject doesn't stack them.
@@ -80,13 +99,39 @@ def build_message(from_addr: str, to_addr: str, subject: str, body: str) -> Emai
     set_content() picks the transfer encoding and charset, so a body with
     non-ASCII (or a very long line) is encoded correctly rather than mangled
     or silently rejected by the server.
+
+    Date and Message-ID are set explicitly so the copy saved to the Sent folder
+    displays with the right timestamp and a stable id (SMTP would otherwise leave
+    the appended copy dateless). Both are standard, well-formed headers; the
+    Gmail API preserves supplied headers, so this is benign for that path too.
+    The Message-ID domain is taken from the sender address rather than the
+    machine hostname make_msgid() would otherwise leak.
     """
     message = EmailMessage()
     message["From"] = from_addr
     message["To"] = to_addr
     message["Subject"] = subject
+    message["Date"] = email.utils.format_datetime(datetime.now(config.TIMEZONE))
+    msgid_domain = (from_addr.rsplit("@", 1)[-1].strip() or None) if from_addr else None
+    message["Message-ID"] = email.utils.make_msgid(domain=msgid_domain)
     message.set_content(body)
     return message
+
+
+def _find_sent_folder(client: IMAPClient) -> str | None:
+    """Locate an account's Sent folder, or None. find_special_folder() checks
+    the \\Sent SPECIAL-USE attribute and common names (incl. namespace-prefixed
+    'INBOX.Sent'); the fallback catches servers that advertise neither by
+    matching the last path segment case-insensitively."""
+    folder = client.find_special_folder(_IMAP_SENT_FLAG)
+    if folder:
+        return folder
+    for flags, delimiter, name in client.list_folders():
+        delim = delimiter.decode() if isinstance(delimiter, bytes) else (delimiter or "")
+        leaf = name.rsplit(delim, 1)[-1] if delim else name
+        if leaf.strip().lower() in _SENT_FALLBACK_NAMES:
+            return name
+    return None
 
 
 # ── Sender contract ───────────────────────────────────────────────────────────
@@ -157,6 +202,39 @@ class SmtpSender:
         message = build_message(self.sender_address(credentials), to_addr, subject, body)
         with self._connect(credentials) as client:
             client.send_message(message)
+
+        # Best-effort: save a copy to the IMAP Sent folder. The mail has already
+        # been delivered by SMTP above, so a failure here must NEVER propagate —
+        # raising would make the caller speak a send FAILURE for a message that
+        # actually went out, and leave the boss with no record either way.
+        try:
+            self._append_to_sent(credentials, message)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Sent to {to_addr}, but couldn't save a copy to the Sent folder: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _append_to_sent(self, credentials: dict, message: EmailMessage) -> None:
+        """Append the just-sent message to the account's Sent folder over IMAP,
+        reusing the same incoming credentials ImapFetcher connects with. A no-op
+        (logged) if no Sent folder can be located; folders are never created."""
+        host = credentials["host"]
+        port = int(credentials.get("port") or 993)
+        use_ssl = bool(credentials.get("use_ssl", True))
+        with IMAPClient(host, port=port, ssl=use_ssl, timeout=SENT_APPEND_TIMEOUT_S) as client:
+            client.login(credentials["username"], credentials["password"])
+            folder = _find_sent_folder(client)
+            if not folder:
+                logger.info("No Sent folder found on the IMAP server — skipping the Sent copy.")
+                return
+            client.append(
+                folder,
+                message.as_bytes(),
+                flags=(imapclient.SEEN,),
+                msg_time=datetime.now(config.TIMEZONE),
+            )
+            logger.info(f"Saved a copy of the sent message to '{folder}'.")
 
     def test_connection(self, credentials: dict) -> None:
         with self._connect(credentials) as client:
@@ -244,6 +322,11 @@ if __name__ == "__main__":
     check("body round-trips", msg.get_content().strip() == "Hi,\n\nLet's meet at 5pm.")
     check("content type is text/plain", msg.get_content_type() == "text/plain")
     check("serializes to bytes", isinstance(msg.as_bytes(), bytes))
+    check("Date header present", bool(msg["Date"]))
+    check("Date parses back to a datetime", email.utils.parsedate_to_datetime(msg["Date"]) is not None)
+    check("Message-ID present and bracketed",
+          bool(msg["Message-ID"]) and msg["Message-ID"].startswith("<") and msg["Message-ID"].endswith(">"))
+    check("Message-ID domain is the sender's", msg["Message-ID"].rstrip(">").endswith("@codex.com"))
 
     unicode_msg = build_message("me@codex.com", "you@acme.com", "Café", "Naïve résumé — 5pm\n")
     check("non-ascii body round-trips", "résumé" in unicode_msg.get_content())
@@ -252,18 +335,37 @@ if __name__ == "__main__":
           isinstance(base64.urlsafe_b64encode(unicode_msg.as_bytes()).decode("ascii"), str))
 
     smoke = {k: os.environ.get(f"SMOKE_SMTP_{k}") for k in ("HOST", "USER", "PASS", "TO")}
+    imap_host = os.environ.get("SMOKE_IMAP_HOST")  # optional: enables the real Sent-append + verify
     if all(smoke.values()):
         print(f"\n-- live SMTP send to {smoke['TO']} --")
+        # When SMOKE_IMAP_HOST is set, credentials carry a real incoming host so
+        # the Sent-folder append actually runs and can be verified below. Without
+        # it, "host" is the SMTP host and the append will log a warning and be
+        # skipped — that warning is EXPECTED, not a failure of the send.
+        creds = {"host": imap_host or smoke["HOST"], "username": smoke["USER"], "password": smoke["PASS"]}
+        marker = f"Lana send/append smoke {os.getpid()}"
         try:
-            SmtpSender().send(
-                {"credentials": {
-                    "host": smoke["HOST"], "username": smoke["USER"], "password": smoke["PASS"],
-                }},
-                smoke["TO"], "Lana SMTP smoke test", "This is a test send from core/email_send.py.",
-            )
+            SmtpSender().send({"credentials": creds}, smoke["TO"], marker,
+                              "This is a test send from core/email_send.py.")
             check("live send succeeded", True)
         except Exception as exc:
             check(f"live send succeeded (got {type(exc).__name__}: {exc})", False)
+
+        if imap_host:
+            print(f"-- verifying Sent copy on {imap_host} --")
+            try:
+                with IMAPClient(imap_host, ssl=True, timeout=SENT_APPEND_TIMEOUT_S) as vclient:
+                    vclient.login(smoke["USER"], smoke["PASS"])
+                    sent = _find_sent_folder(vclient)
+                    check("Sent folder was located", bool(sent))
+                    if sent:
+                        vclient.select_folder(sent, readonly=True)
+                        uids = vclient.search(["SUBJECT", marker])
+                        check("sent message appears in the Sent folder", len(uids) >= 1)
+            except Exception as exc:
+                check(f"Sent-folder verify (got {type(exc).__name__}: {exc})", False)
+        else:
+            print("(Sent-append not exercised — set SMOKE_IMAP_HOST to the IMAP host to verify it)")
     else:
         print("\n(skipping live send — set SMOKE_SMTP_HOST/_USER/_PASS/_TO to enable)")
 

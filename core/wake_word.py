@@ -119,12 +119,22 @@ class WakeWordDetector:
             logger.warning("WakeWordDetector is already running.")
             return
 
-        logger.info(f"Loading openwakeword model: '{self._model_name}' (framework={self._inference_framework})")
-        self._oww = Model(
-            wakeword_models=[self._model_name],
-            inference_framework=self._inference_framework,
-        )
-        logger.success(f"Model loaded. Threshold = {self._threshold}")
+        if self._oww is None:
+            logger.info(f"Loading openwakeword model: '{self._model_name}' (framework={self._inference_framework})")
+            self._oww = Model(
+                wakeword_models=[self._model_name],
+                inference_framework=self._inference_framework,
+            )
+            logger.success(f"Model loaded. Threshold = {self._threshold}")
+        else:
+            # Reuse the already-loaded model across stop()/start() cycles. Each
+            # conversation stops the detector, and barge-in starts a second
+            # detector per spoken utterance — rebuilding the three onnxruntime
+            # sessions every time would add hundreds of ms of latency on the
+            # conversation thread. reset() clears the streaming context so stale
+            # audio can't fire a phantom detection right after restart.
+            self._oww.reset()
+            logger.debug("Reusing loaded openwakeword model (reset streaming context).")
 
         self._pa = pyaudio.PyAudio()
         self._running.set()

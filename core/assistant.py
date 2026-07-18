@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import smtplib
@@ -35,6 +36,10 @@ from core.email_manager import (
     CONFIRM_YES,
     EmailManager,
     VAGUE_TIMEFRAME_DAYS_BACK_DEFAULT,
+    account_candidate_tokens,
+    account_hint_tokens,
+    account_hotwords,
+    account_matches_hint,
 )
 from core.llm import LLMEngine
 from core.memory import (
@@ -65,6 +70,15 @@ SEND_CONFIRM_SILENCE_TIMEOUT: float = 15.0
 # letter by letter takes a moment, and the boss may be switching to the
 # dashboard to type it instead of saying it.
 ADDRESS_ENTRY_SILENCE_TIMEOUT: float = 15.0
+
+# Confidence threshold for the barge-in detector that listens WHILE Lana is
+# speaking, so the boss can cut off a long/wrong reply by saying the wake word.
+# Higher than config.WAKE_WORD_THRESHOLD (the idle wake word): a false trigger
+# here interrupts speech mid-sentence, so it should be harder to fire than a
+# normal wake. NOTE (Lana): hey_lana.onnx was trained on Kokoro-synthesized
+# audio and the TTS voice is also Kokoro, so self-trigger risk is higher than on
+# Jarvis — run the self-trigger soak test and raise this if the voice trips it.
+BARGE_IN_THRESHOLD: float = 0.6
 
 # Trigger phrases that mark an explicit "remember this" voice command.
 MEMORY_TRIGGER_PHRASES: tuple[str, ...] = ("remember that", "don't forget")
@@ -108,6 +122,69 @@ MAX_SEND_REVISION_ROUNDS: int = 3
 # before the send is cancelled outright. Two: one blunt "yes or no" retry, then
 # stop. Never guess in favor of sending.
 MAX_SEND_CONFIRM_ROUNDS: int = 2
+# Attempts to pin down which account to send FROM — and, separately, which
+# stored person a spoken name refers to — before giving up. A combined request
+# usually resolves the account with no question at all; this only covers a
+# genuinely ambiguous or misheard answer, so one STT slip doesn't throw away the
+# recipient and message the boss already gave. Exhaustion still exits toward NOT
+# sending.
+MAX_ACCOUNT_ROUNDS: int = 2
+MAX_DISAMBIG_ROUNDS: int = 2
+
+# Spoken answers that explicitly abandon a send sub-dialogue mid-question. The
+# single words are matched as whole tokens (so "stop"/"none" can't false-fire
+# from inside another word); the phrases are matched as substrings.
+_SEND_CANCEL_WORDS: frozenset[str] = frozenset({
+    "cancel", "stop", "neither", "none", "abort", "nevermind",
+})
+_SEND_CANCEL_PHRASES: tuple[str, ...] = (
+    "never mind", "forget it", "don't send", "do not send", "not now",
+    "no thanks", "leave it", "not right now",
+)
+
+# Positional words for "the second one" style answers to a which-one question,
+# resolved against the order the options were spoken in. "one"/"two"/"three" are
+# deliberately excluded — too easily confused with "the gmail one".
+_ORDINAL_WORDS: dict[str, int] = {
+    "first": 0, "1st": 0, "former": 0,
+    "second": 1, "2nd": 1, "latter": 1,
+    "third": 2, "3rd": 2,
+    "fourth": 3, "4th": 3,
+    "fifth": 4, "5th": 4,
+}
+
+
+def _ordinal_index(answer: str, n: int) -> int | None:
+    """Index a positional answer ("the first one", "the last") into an
+    n-option list, or None if the answer names no position."""
+    tokens = set(re.findall(r"[a-z0-9]+", (answer or "").lower()))
+    if "last" in tokens and n >= 1:
+        return n - 1
+    for word, idx in _ORDINAL_WORDS.items():
+        if word in tokens and idx < n:
+            return idx
+    return None
+
+
+def _or_list(items: list[str]) -> str:
+    """"A", "A or B", or "A, B, or C" — for reading a set of options aloud."""
+    items = [i for i in items if i]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} or {items[1]}"
+    return ", ".join(items[:-1]) + f", or {items[-1]}"
+
+
+def _is_cancel(text: str) -> bool:
+    """Whether a spoken answer to a send-flow question is an explicit abandon."""
+    lowered = (text or "").strip().lower()
+    tokens = set(re.findall(r"[a-z']+", lowered))
+    if tokens & _SEND_CANCEL_WORDS:
+        return True
+    return any(phrase in lowered for phrase in _SEND_CANCEL_PHRASES)
 
 # Spoken renderings for the characters that appear in an email address, used to
 # read one back for confirmation. Derived in Python from the VALIDATED address
@@ -196,6 +273,20 @@ class LanaAssistant:
             threshold=config.WAKE_WORD_THRESHOLD,
             device_index=config.MIC_DEVICE_INDEX,
             on_failure=self._on_detector_failure,
+        )
+
+        # A SECOND detector, run only while Lana is speaking, so the boss can
+        # interrupt a long/wrong reply by saying the wake word ("barge-in"). Its
+        # callback only stops the TTS — it must never poke _wake_event/
+        # _wake_word_pending, or it would queue a phantom extra conversation. It
+        # shares the same wake model but uses a higher threshold, and its
+        # failures are logged, not surfaced as the pipeline "deaf" error.
+        self._barge_detector = WakeWordDetector(
+            callback=self._on_barge_in,
+            model_name=config.WAKE_WORD_MODEL,
+            threshold=BARGE_IN_THRESHOLD,
+            device_index=config.MIC_DEVICE_INDEX,
+            on_failure=self._on_barge_failure,
         )
 
         # Last unrecoverable component failure (e.g. dead mic), surfaced via
@@ -409,6 +500,22 @@ class LanaAssistant:
             return text[idx + len(trigger):].strip(" ,.:;!?").strip()
         return None
 
+    def _speak(self, text: str) -> bool:
+        """
+        Speak `text` with barge-in enabled: the boss can interrupt by saying the
+        wake word. Returns True if it played to the end, False if interrupted.
+
+        The barge detector runs ONLY for the duration of this call and is always
+        stopped before returning, so the next STT listen has the microphone to
+        itself — WakeWordDetector and STTEngine can't both hold the mic, but the
+        detector listening during speaker output is fine (different device).
+        """
+        self._barge_detector.start()
+        try:
+            return self._tts.speak(text)
+        finally:
+            self._barge_detector.stop()
+
     def _speak_confirmation(self, reply: str) -> None:
         """
         Emit + speak a fixed confirmation line, reusing the same state/event
@@ -418,11 +525,15 @@ class LanaAssistant:
         self._emit_event("llm_response", text=reply)
         self._set_state(AssistantState.SPEAKING)
         self._emit_event("speaking_started")
-        self._tts.speak(reply)
+        self._speak(reply)
         self._emit_event("speaking_ended")
 
     def _ask_and_listen(
-        self, question: str, *, silence_timeout: float = FOLLOWUP_SILENCE_TIMEOUT
+        self,
+        question: str,
+        *,
+        silence_timeout: float = FOLLOWUP_SILENCE_TIMEOUT,
+        hotwords: str | None = None,
     ) -> str:
         """
         Speak a clarifying question, then listen for the answer. Returns the
@@ -434,11 +545,16 @@ class LanaAssistant:
         speaking. It defaults to the ordinary follow-up window; the send flow
         passes a much longer one, because deciding whether to send a drafted
         email is thinking, not reacting.
+
+        `hotwords` biases STT decoding toward an expected vocabulary — pass it
+        when the answer is drawn from a known set (account names, contacts).
         """
         self._speak_confirmation(question)
         self._set_state(AssistantState.LISTENING)
         self._emit_event("listening_started")
-        answer = self._stt.listen_and_transcribe(initial_silence_timeout=silence_timeout)
+        answer = self._stt.listen_and_transcribe(
+            initial_silence_timeout=silence_timeout, hotwords=hotwords
+        )
         if answer.strip():
             logger.info(f"[Clarifying answer] '{answer}'")
             self._emit_event("transcription", text=answer)
@@ -1374,26 +1490,56 @@ class LanaAssistant:
         return name, address
 
     def _disambiguate_person(self, matches: list[dict]) -> dict | None:
-        """Several stored people match the spoken name. Ask which, and resolve
-        the answer by name. Returns None having spoken the outcome itself."""
+        """Several stored people match the spoken name. Ask which, resolving the
+        answer by name / position / near-match, and keep asking (bounded) so a
+        single misheard answer doesn't abandon the send. Returns None having
+        spoken the outcome itself."""
         names = [_clean(p.get("name")) for p in matches]
-        options = ", ".join(names[:-1]) + f", or {names[-1]}"
-        answer = self._ask_and_listen(f"I know a few — {options}. Which one?")
-        self._set_state(AssistantState.THINKING)
+        hotwords = ", ".join(n for n in names if n)
+        question = f"I know a few — {_or_list(names)}. Which one?"
+        for _ in range(MAX_DISAMBIG_ROUNDS):
+            answer = self._ask_and_listen(question, hotwords=hotwords)
+            self._set_state(AssistantState.THINKING)
+            question = f"Sorry — {_or_list(names)}?"
 
-        if not answer.strip():
-            self._speak_confirmation("No problem — I haven't sent anything.")
-            return None
-
-        lowered = answer.lower()
-        # Longest name first, so "Michael Heckin" beats a bare "Michael" when
-        # the boss said the full name.
-        for person in sorted(matches, key=lambda p: -len(_clean(p.get("name")))):
-            if _clean(person.get("name")).lower() in lowered:
+            stripped = answer.strip()
+            if not stripped:
+                continue
+            if _is_cancel(stripped):
+                self._speak_confirmation("No problem — I haven't sent anything.")
+                return None
+            person = self._match_person_answer(stripped, matches)
+            if person is not None:
                 return person
 
         self._speak_confirmation("Sorry, I couldn't tell which one you meant — I haven't sent anything.")
         return None
+
+    @staticmethod
+    def _match_person_answer(answer: str, matches: list[dict]) -> dict | None:
+        """Resolve a spoken answer to exactly one of `matches`, or None if it's
+        ambiguous/unrecognized. Exact name substring (longest first) → positional
+        ordinal → fuzzy per-token, accepted only when a single person is hit."""
+        lowered = answer.lower()
+        # Longest name first, so "Michael Heckin" beats a bare "Michael" when
+        # the boss said the full name.
+        for person in sorted(matches, key=lambda p: -len(_clean(p.get("name")))):
+            name = _clean(person.get("name")).lower()
+            if name and name in lowered:
+                return person
+
+        idx = _ordinal_index(answer, len(matches))
+        if idx is not None:
+            return matches[idx]
+
+        answer_tokens = re.findall(r"[a-z0-9]+", lowered)
+        hits: list[dict] = []
+        for person in matches:
+            name_tokens = re.findall(r"[a-z0-9]+", _clean(person.get("name")).lower())
+            if any(difflib.get_close_matches(t, name_tokens, n=1, cutoff=0.8)
+                   for t in answer_tokens):
+                hits.append(person)
+        return hits[0] if len(hits) == 1 else None
 
     def _resolve_send_account(self, account_hint: str | None) -> dict | None:
         """
@@ -1417,33 +1563,77 @@ class LanaAssistant:
                 self._speak_confirmation("You don't have any email accounts connected yet.")
                 return None
 
+        # More than one candidate. Ask, and keep asking (bounded) so a single
+        # STT slip on the account name doesn't discard the recipient/message the
+        # boss already gave — every non-answer still exits toward NOT sending.
         labels = [a["label"] for a in accounts]
-        options = ", ".join(labels[:-1]) + f", or {labels[-1]}"
-        answer = self._ask_and_listen(f"Which account should I send from — {options}?")
-        self._set_state(AssistantState.THINKING)
+        hotwords = account_hotwords(accounts)
+        question = f"Which account should I send from — {_or_list(labels)}?"
+        for _ in range(MAX_ACCOUNT_ROUNDS):
+            answer = self._ask_and_listen(question, hotwords=hotwords)
+            self._set_state(AssistantState.THINKING)
+            question = f"Sorry — was that {_or_list(labels)}?"
 
-        if answer.strip():
-            narrowed = self._email.resolve_accounts_by_hint(answer.strip())
-            if len(narrowed) == 1:
-                return narrowed[0]
-            for account in accounts:
-                if account["label"].lower() in answer.lower():
-                    return account
+            stripped = answer.strip()
+            if not stripped:
+                continue
+            if _is_cancel(stripped):
+                self._speak_confirmation("No problem — I haven't sent anything.")
+                return None
+            account = self._match_account_answer(stripped, accounts)
+            if account is not None:
+                return account
 
         self._speak_confirmation("I wasn't sure which account you meant, so I haven't sent anything.")
         return None
 
-    def _speak_draft(self, name: str, address: str, draft: dict) -> None:
+    @staticmethod
+    def _match_account_answer(answer: str, accounts: list[dict]) -> dict | None:
+        """Resolve a spoken which-account answer to exactly one of `accounts`,
+        or None if ambiguous/unrecognized. Deterministic token/alias match →
+        positional ordinal → fuzzy per-token for STT garble ("gmael" → gmail),
+        the fuzzy step accepted ONLY when it points to a single account (a wrong
+        guess is still caught by the account-named readback + confirmation)."""
+        narrowed = [a for a in accounts if account_matches_hint(a, answer)]
+        if len(narrowed) == 1:
+            return narrowed[0]
+
+        idx = _ordinal_index(answer, len(accounts))
+        if idx is not None:
+            return accounts[idx]
+
+        answer_tokens = account_hint_tokens(answer)
+        if answer_tokens:
+            hits: list[dict] = []
+            for account in accounts:
+                candidates = list(account_candidate_tokens(account))
+                if any(difflib.get_close_matches(t, candidates, n=1, cutoff=0.75)
+                       for t in answer_tokens):
+                    hits.append(account)
+            if len(hits) == 1:
+                return hits[0]
+
+        return None
+
+    def _speak_draft(
+        self, name: str, address: str, draft: dict, account_label: str | None = None
+    ) -> None:
         """
         Read a drafted email back for approval. Sanitizes every spoken part.
+
+        When `account_label` is given (the boss has more than one account
+        connected), the sending identity is named in the readback — so a
+        misheard/fuzzy-matched account is heard before the mandatory
+        confirmation, not discovered after the mail has left.
 
         Deliberately NOT routed through _read_email_aloud: that is the read
         path for RECEIVED mail, and it clears pending_search and overwrites
         last_read — which would silently destroy the very referent a reply was
         resolved from, mid-send.
         """
+        from_part = f"From {sanitize_body_text(account_label)}, " if account_label else ""
         self._speak_confirmation(
-            f"Here's what I've got. To {sanitize_body_text(name)}, at "
+            f"Here's what I've got. {from_part}To {sanitize_body_text(name)}, at "
             f"{self._spell_email_for_speech(address)}. "
             f"Subject: {sanitize_body_text(draft['subject'])}. "
             f"{sanitize_body_text(draft['body'])}"
@@ -1509,9 +1699,14 @@ class LanaAssistant:
         There is no path from "unclear" to a send.
         """
         revisions = 0
+        # Name the sending account in the readback only when there's a choice to
+        # get wrong — a single-account setup never sends from the "wrong" one.
+        account_label = (
+            account["label"] if len(self._email.list_accounts_safe()) > 1 else None
+        )
 
         while True:
-            self._speak_draft(name, address, draft)
+            self._speak_draft(name, address, draft, account_label=account_label)
             answer = self._ask_and_listen(
                 "Should I send it?", silence_timeout=SEND_CONFIRM_SILENCE_TIMEOUT
             )
@@ -1625,6 +1820,25 @@ class LanaAssistant:
         self._last_error = f"wake word detector: {reason}"
         self._emit_event("error", message=self._last_error)
 
+    def _on_barge_in(self) -> None:
+        """
+        Wake word heard WHILE Lana is speaking. Stops the current utterance
+        only — deliberately does NOT set _wake_word_pending/_wake_event (that
+        would spawn a second conversation). The turn loop simply proceeds to its
+        next listen once the interrupted speak() returns, so the boss's follow-up
+        is picked up as the next turn.
+        """
+        logger.info("Barge-in detected — cutting off playback.")
+        self._tts.request_stop()
+
+    def _on_barge_failure(self, reason: str) -> None:
+        """
+        A transient mic hiccup on the barge detector must NOT flip the frontend
+        into the 'deaf' error state — the main detector's next start is the
+        health authority for that. Log only.
+        """
+        logger.warning(f"Barge-in detector failure (non-fatal): {reason}")
+
     def _start_detector(self) -> None:
         """
         Start the wake detector with a clean error slate. If the mic is still
@@ -1676,7 +1890,7 @@ class LanaAssistant:
                 email_ctx["announced"] = self._email.get_announced_context()
             else:
                 logger.info("[Greeting] Speaking opening line…")
-                self._tts.speak("Hey, how can I help you today?")
+                self._speak("Hey, how can I help you today?")
 
             first_turn = True
 
@@ -1746,12 +1960,17 @@ class LanaAssistant:
                 )
                 self._emit_event("llm_response", text=reply)
 
-                # ── 3f. Speak the response ────────────────────────────────────
+                # ── 3f. Speak the response (barge-in enabled) ─────────────────
                 self._set_state(AssistantState.SPEAKING)
                 self._emit_event("speaking_started")
                 logger.info(f"[Speaking] '{reply[:80]}{'…' if len(reply) > 80 else ''}'")
-                self._tts.speak(reply)
+                completed = self._speak(reply)
                 self._emit_event("speaking_ended")
+                if not completed:
+                    # The boss talked over the reply — note it so Claude knows
+                    # this answer wasn't fully heard, then listen for what he
+                    # actually wants (picked up as the next turn).
+                    self._llm.note_interrupted_reply()
 
                 # Loop back to listen for follow-up
 
@@ -1790,6 +2009,10 @@ class LanaAssistant:
             self._emit_event("idle")
             self._wake_word_pending = False
             self._wake_event.clear()  # discard any stale wake events
+            # Belt-and-braces: _speak() stops the barge detector after every
+            # utterance, but an exception mid-speak must not leave it holding the
+            # mic when the main detector restarts (both can't hold it at once).
+            self._barge_detector.stop()
             if self._running:
                 logger.success("─" * 50)
                 logger.success("Ready. Say 'Hey Lana' to begin a new conversation.")
@@ -1807,6 +2030,7 @@ class LanaAssistant:
         with self._shutdown_lock:
             logger.info("Stopping wake detector…")
             self._detector.stop()
+            self._barge_detector.stop()
 
             logger.info("Shutting down TTS engine…")
             self._tts.shutdown()
