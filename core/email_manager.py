@@ -1034,6 +1034,18 @@ class EmailManager:
                     "it tonight\"). Recipient and message content are extracted by a "
                     "separate call - do not try to fill them in here.\n"
                     f"{dismiss_line}\n"
+                    # Kept OUT of the not_email bullet on purpose. Phrasing this
+                    # exclusion in terms of "sending or replying to a message
+                    # about a plan is still email" measurably pulled a bare
+                    # "reply with a joke" from not_email (5/5) to send_email
+                    # (4/5) - naming reply/send inside that bullet reweighted
+                    # them everywhere. Anchoring on the CLINICAL task instead,
+                    # and stating it after the intent list, leaves the
+                    # reply/send semantics untouched.
+                    "Drafting a treatment plan, protocol or supplement plan for a "
+                    "PATIENT, dictating a patient case, and asking whether a case "
+                    "should be referred out are all not_email - a separate pipeline "
+                    "handles clinical drafting.\n"
                     "Respond with ONLY a JSON object (no markdown fences, no commentary) with "
                     "exactly these keys: intent (one of the above), account_hint (string or "
                     "null - an account label/provider name ONLY if the user explicitly said "

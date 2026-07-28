@@ -1,0 +1,752 @@
+{
+  "version": 1,
+  "reviewed_by": null,
+  "reviewed_on": null,
+  "review_status": "PENDING — distilled from sources/02 and sources/03 by the implementer. Not yet reviewed by Alexandra. Every rendered draft states this until she signs off.",
+  "_schema_notes": {
+    "verbatim": "MUST be an exact substring of the referenced source file. plan_rules_check.py asserts this. It is printed next to any model claim citing the rule, so Alexandra always reviews against her own sentence rather than a paraphrase.",
+    "referral_kind": "refer_out = send the patient elsewhere instead of (or alongside) treating. test_first = do not start this specific intervention until the named labs exist; not a referral of the whole case.",
+    "action": "avoid = never in this context. limit = dose ceiling. caution = permitted with monitoring. separate = timing conflict only. test_first = requires labs before use. lab_interference = distorts a test result."
+  },
+
+  "referral_rules": [
+    {
+      "id": "REF-A1",
+      "kind": "refer_out",
+      "category": "unexplained_or_severe",
+      "criteria": "Unexplained weight loss or weight gain with no identified cause",
+      "refer_to": "Physician for deeper investigation",
+      "verbatim": "Weight loss or gain without cause",
+      "source": "02_referral_criteria.md#unexplained-or-severe-symptoms"
+    },
+    {
+      "id": "REF-A2",
+      "kind": "refer_out",
+      "category": "unexplained_or_severe",
+      "criteria": "Dizziness, fainting, or arrhythmia-like symptoms (palpitations, irregular heartbeat)",
+      "refer_to": "Physician / cardiology",
+      "verbatim": "Dizziness, syncope, arrhythmia-like symptoms",
+      "source": "02_referral_criteria.md#unexplained-or-severe-symptoms"
+    },
+    {
+      "id": "REF-A3",
+      "kind": "refer_out",
+      "category": "unexplained_or_severe",
+      "criteria": "Fatigue that persists despite mitochondrial and GI support already having been tried",
+      "refer_to": "Physician for deeper investigation",
+      "verbatim": "Persistent fatigue despite mitochondrial/GI support",
+      "source": "02_referral_criteria.md#unexplained-or-severe-symptoms"
+    },
+    {
+      "id": "REF-B1",
+      "kind": "refer_out",
+      "category": "no_improvement_8_12_weeks",
+      "criteria": "No symptom change after a full protocol has run 8–12 weeks (e.g. constipation unchanged after a complete 5R plan)",
+      "refer_to": "Physician for deeper investigation",
+      "verbatim": "E.g., no change in constipation after full 5R plan",
+      "source": "02_referral_criteria.md#symptoms-not-improving-after-812-weeks"
+    },
+    {
+      "id": "REF-B2",
+      "kind": "refer_out",
+      "category": "no_improvement_8_12_weeks",
+      "criteria": "Skin rashes ongoing despite gut and histamine protocols having been completed",
+      "refer_to": "Dermatology / physician",
+      "verbatim": "Ongoing skin rashes despite gut + histamine protocols",
+      "source": "02_referral_criteria.md#symptoms-not-improving-after-812-weeks"
+    },
+    {
+      "id": "REF-C1",
+      "kind": "refer_out",
+      "category": "red_flag_cluster",
+      "criteria": "Night sweats AND weight loss AND pain occurring together",
+      "refer_to": "Imaging / oncology referral",
+      "verbatim": "Night sweats + weight loss + pain (consider imaging, oncology referral)",
+      "source": "02_referral_criteria.md#red-flag-clusters"
+    },
+    {
+      "id": "REF-C2",
+      "kind": "refer_out",
+      "category": "red_flag_cluster",
+      "criteria": "Blood in stool, black tarry stools, or anemia of unknown origin",
+      "refer_to": "GI referral",
+      "verbatim": "Blood in stool, black tarry stools, anemia of unknown origin (GI referral)",
+      "source": "02_referral_criteria.md#red-flag-clusters"
+    },
+    {
+      "id": "REF-C3",
+      "kind": "refer_out",
+      "category": "red_flag_cluster",
+      "criteria": "Frequent infections together with persistent swollen lymph nodes",
+      "refer_to": "Immune workup",
+      "verbatim": "Frequent infections, persistent lymphadenopathy (immune workup)",
+      "source": "02_referral_criteria.md#red-flag-clusters"
+    },
+    {
+      "id": "REF-C4",
+      "kind": "refer_out",
+      "category": "red_flag_cluster",
+      "criteria": "Unilateral (one-sided) headaches, or any neurological symptoms",
+      "refer_to": "Neurology or imaging",
+      "verbatim": "Unilateral headaches or neurological symptoms (neuro or imaging)",
+      "source": "02_referral_criteria.md#red-flag-clusters"
+    },
+    {
+      "id": "REF-D1",
+      "kind": "test_first",
+      "category": "before_specific_intervention",
+      "criteria": "DHEA is being considered",
+      "blocks_intervention": ["DHEA"],
+      "refer_to": "Hormone and adrenal marker testing before starting",
+      "verbatim": "Considering DHEA → check hormones & adrenal markers",
+      "source": "02_referral_criteria.md#before-specific-interventions"
+    },
+    {
+      "id": "REF-D2",
+      "kind": "test_first",
+      "category": "before_specific_intervention",
+      "criteria": "Methylation support is being considered",
+      "blocks_intervention": ["methylation support", "5-MTHF", "methylfolate", "methylated B vitamins", "SAMe"],
+      "refer_to": "Homocysteine, B12 and MTHFR testing before starting",
+      "verbatim": "Considering methylation support → check homocysteine, B12, MTHFR",
+      "source": "02_referral_criteria.md#before-specific-interventions"
+    },
+    {
+      "id": "REF-D3",
+      "kind": "test_first",
+      "category": "before_specific_intervention",
+      "criteria": "History of recurring miscarriages",
+      "refer_to": "Thyroid, PCOS, progesterone and clotting factor testing",
+      "verbatim": "Recurring miscarriages → test thyroid, PCOS, progesterone, clotting factors",
+      "source": "02_referral_criteria.md#before-specific-interventions"
+    },
+    {
+      "id": "REF-E1",
+      "kind": "refer_out",
+      "category": "another_specialty",
+      "criteria": "Pelvic pain that has not responded to gut support",
+      "refer_to": "GYN, pelvic ultrasound",
+      "verbatim": "Pelvic pain unresponsive to gut support → GYN, pelvic ultrasound",
+      "source": "02_referral_criteria.md#when-symptoms-suggest-another-specialty"
+    },
+    {
+      "id": "REF-E2",
+      "kind": "refer_out",
+      "category": "another_specialty",
+      "criteria": "Severe joint pain",
+      "refer_to": "Rheumatology",
+      "verbatim": "Severe joint pain → rheumatology",
+      "source": "02_referral_criteria.md#when-symptoms-suggest-another-specialty"
+    },
+    {
+      "id": "REF-E3",
+      "kind": "refer_out",
+      "category": "another_specialty",
+      "criteria": "Chronic cough together with GI issues",
+      "refer_to": "Rule out GERD; pulmonary referral",
+      "verbatim": "Chronic cough + GI issues → rule out GERD, pulmonary referral",
+      "source": "02_referral_criteria.md#when-symptoms-suggest-another-specialty"
+    },
+    {
+      "id": "REF-F1",
+      "kind": "refer_out",
+      "category": "dermatology",
+      "criteria": "Severe cystic acne, or acne scarring present",
+      "refer_to": "Dermatologist",
+      "verbatim": "Refer to dermatologist if severe cystic acne or scarring present.",
+      "source": "07_skin_conditions.md#1-acne"
+    },
+    {
+      "id": "REF-F2",
+      "kind": "refer_out",
+      "category": "dermatology",
+      "criteria": "Moderate or severe rosacea",
+      "refer_to": "Dermatologist (laser or topical prescription)",
+      "verbatim": "Referral to dermatologist for possible laser or topical prescription meds if moderate/severe.",
+      "source": "07_skin_conditions.md#2-rosacea"
+    },
+    {
+      "id": "REF-F3",
+      "kind": "refer_out",
+      "category": "dermatology",
+      "criteria": "Severe or infected eczema lesions",
+      "refer_to": "Dermatologist",
+      "verbatim": "Referral to dermatologist if severe or infected lesions.",
+      "source": "07_skin_conditions.md#3-eczema-atopic-dermatitis"
+    }
+  ],
+
+  "contraindication_rules": [
+    {
+      "id": "CI-KID-1",
+      "trigger": {"conditions": ["kidney impairment", "CKD", "low eGFR", "kidney stones"], "medications": [], "population": null},
+      "restricted": [{"item": "Vitamin D", "action": "limit", "limit": "2000 IU/day unless 25(OH)D is < 20 ng/mL", "note": "Monitor calcium, phosphorus."}],
+      "risk": "Can elevate calcium → risk of vascular calcification, stones",
+      "verbatim": "Keep dose ≤ 2000 IU unless 25(OH)D is < 20 ng/mL. Monitor calcium, phosphorus.",
+      "source": "03_contraindications.md#kidney"
+    },
+    {
+      "id": "CI-KID-2",
+      "trigger": {"conditions": ["stage 3+ CKD", "kidney stones", "kidney impairment"], "medications": [], "population": null},
+      "restricted": [{"item": "Calcium", "action": "caution", "note": "Citrate form preferred if needed. Avoid in stage 3+ CKD unless deficiency."}],
+      "risk": "Increases stone risk, vascular calcification",
+      "verbatim": "Use cautiously; citrate form preferred if needed. Avoid in stage 3+ CKD unless deficiency.",
+      "source": "03_contraindications.md#kidney"
+    },
+    {
+      "id": "CI-KID-3",
+      "trigger": {"conditions": ["CKD", "elevated creatinine", "kidney impairment"], "medications": [], "population": null},
+      "restricted": [{"item": "Creatine", "action": "avoid"}],
+      "risk": "Risk of elevated creatinine and metabolic load",
+      "verbatim": "Avoid in CKD or elevated creatinine.",
+      "source": "03_contraindications.md#kidney"
+    },
+    {
+      "id": "CI-KID-4",
+      "trigger": {"conditions": ["kidney impairment", "GFR below 60", "CKD"], "medications": [], "population": null},
+      "restricted": [{"item": "Potassium (including multivitamins and electrolyte blends containing potassium)", "action": "avoid", "note": "Monitor potassium if GFR < 60."}],
+      "risk": "Risk of hyperkalemia",
+      "verbatim": "Monitor potassium if GFR < 60. Avoid potassium-containing blends.",
+      "source": "03_contraindications.md#kidney"
+    },
+    {
+      "id": "CI-KID-5",
+      "trigger": {"conditions": ["kidney impairment", "GFR below 30", "CKD"], "medications": [], "population": null},
+      "restricted": [
+        {"item": "Magnesium oxide", "action": "avoid"},
+        {"item": "Magnesium (any form)", "action": "limit", "limit": "200–300 mg/day", "note": "Prefer bisglycinate or taurate."}
+      ],
+      "risk": "Accumulation if GFR < 30 → arrhythmia risk",
+      "verbatim": "Use ≤ 200–300 mg/day, prefer bisglycinate or taurate. Avoid magnesium oxide.",
+      "source": "03_contraindications.md#kidney"
+    },
+    {
+      "id": "CI-KID-6",
+      "trigger": {"conditions": ["kidney impairment", "CKD"], "medications": [], "population": null},
+      "restricted": [{"item": "Phosphorus-containing supplements", "action": "avoid", "note": "Unless phosphorus deficiency diagnosed."}],
+      "risk": "Risk of phosphorus overload",
+      "verbatim": "Avoid unless phosphorus deficiency diagnosed.",
+      "source": "03_contraindications.md#kidney"
+    },
+    {
+      "id": "CI-KID-7",
+      "trigger": {"conditions": ["kidney impairment", "CKD"], "medications": [], "population": null},
+      "restricted": [{"item": "Vitamin A (retinol form)", "action": "limit", "limit": "2500 IU/day retinol form", "note": "Prefer beta-carotene if needed."}],
+      "risk": "Can build up, especially in CKD",
+      "verbatim": "Avoid high-dose retinol; prefer beta-carotene if needed. Max 2500 IU/day retinol form.",
+      "source": "03_contraindications.md#kidney"
+    },
+
+    {
+      "id": "CI-LIV-1",
+      "trigger": {"conditions": ["liver dysfunction", "fatty liver", "NAFLD", "NASH", "hepatitis", "elevated liver enzymes"], "medications": [], "population": null},
+      "restricted": [{"item": "Niacin", "action": "limit", "limit": "below 1000 mg/day", "note": "Use flush-free or low-dose niacin if needed. Monitor LFTs."}],
+      "risk": "Hepatotoxic at >1000 mg/day",
+      "verbatim": "Use flush-free or low-dose niacin if needed. Monitor LFTs.",
+      "source": "03_contraindications.md#liver"
+    },
+    {
+      "id": "CI-LIV-2",
+      "trigger": {"conditions": ["liver dysfunction", "fatty liver", "NAFLD", "NASH", "hepatitis", "elevated liver enzymes"], "medications": [], "population": null},
+      "restricted": [{"item": "Vitamin A (retinol)", "action": "limit", "limit": "5000 IU retinol, chronic use", "note": "Use beta-carotene if needed."}],
+      "risk": "Hepatotoxic in high doses",
+      "verbatim": "Avoid chronic use >5000 IU retinol. Use beta-carotene if needed.",
+      "source": "03_contraindications.md#liver"
+    },
+    {
+      "id": "CI-LIV-3",
+      "trigger": {"conditions": ["liver dysfunction", "fatty liver", "NAFLD", "NASH"], "medications": [], "population": null},
+      "restricted": [{"item": "Iron", "action": "test_first", "note": "Only if ferritin < 40 ng/mL and TSAT < 20%."}],
+      "risk": "Risk of hepatic overload in NAFLD/NASH",
+      "verbatim": "Avoid unless ferritin < 40 ng/mL and TSAT < 20%.",
+      "source": "03_contraindications.md#liver"
+    },
+    {
+      "id": "CI-LIV-4",
+      "trigger": {"conditions": ["liver dysfunction", "fatty liver", "NAFLD", "NASH", "hepatitis", "elevated liver enzymes"], "medications": [], "population": null},
+      "restricted": [
+        {"item": "Kava", "action": "avoid"},
+        {"item": "Comfrey", "action": "avoid"},
+        {"item": "Chaparral", "action": "avoid"},
+        {"item": "Skullcap", "action": "avoid"}
+      ],
+      "risk": "Hepatotoxic potential",
+      "verbatim": "Hepatotoxic potential | Avoid completely.",
+      "source": "03_contraindications.md#liver"
+    },
+    {
+      "id": "CI-LIV-5",
+      "trigger": {"conditions": ["liver dysfunction", "fatty liver", "NAFLD", "NASH", "elevated liver enzymes"], "medications": [], "population": null},
+      "restricted": [{"item": "Curcumin", "action": "limit", "limit": "500 mg BID", "note": "Use BCM-95 or Meriva for better tolerability."}],
+      "risk": "Can raise liver enzymes in sensitive patients",
+      "verbatim": "Keep ≤ 500 mg BID; use BCM-95 or Meriva for better tolerability.",
+      "source": "03_contraindications.md#liver"
+    },
+    {
+      "id": "CI-LIV-6",
+      "trigger": {"conditions": ["severe liver failure", "advanced liver dysfunction", "NAFLD", "NASH"], "medications": [], "population": null},
+      "restricted": [{"item": "Acetyl-L-carnitine", "action": "avoid", "note": "Avoid in severe liver failure; use cautiously in NAFLD/NASH."}],
+      "risk": "May be poorly metabolized in advanced liver dysfunction",
+      "verbatim": "Avoid in severe liver failure. Use cautiously in NAFLD/NASH.",
+      "source": "03_contraindications.md#liver"
+    },
+
+    {
+      "id": "CI-AI-1",
+      "trigger": {"conditions": ["autoimmune", "Hashimoto's", "MS", "RA", "SLE", "lupus"], "medications": [], "population": null},
+      "restricted": [{"item": "Echinacea", "action": "avoid"}],
+      "risk": "Immune stimulant",
+      "verbatim": "Avoid; can worsen autoimmunity.",
+      "source": "03_contraindications.md#autoimmune"
+    },
+    {
+      "id": "CI-AI-2",
+      "trigger": {"conditions": ["autoimmune", "Hashimoto's", "MS", "RA", "SLE", "lupus"], "medications": [], "population": null},
+      "restricted": [
+        {"item": "Astragalus", "action": "avoid", "note": "Unless used under supervision for adrenal support (short-term)."},
+        {"item": "Licorice root", "action": "avoid", "note": "Unless used under supervision for adrenal support (short-term)."}
+      ],
+      "risk": "May upregulate immune response",
+      "verbatim": "Avoid unless used under supervision for adrenal support (short-term).",
+      "source": "03_contraindications.md#autoimmune"
+    },
+    {
+      "id": "CI-AI-3",
+      "trigger": {"conditions": ["autoimmune", "Hashimoto's", "MS", "RA", "SLE", "lupus"], "medications": [], "population": null},
+      "restricted": [{"item": "DHEA", "action": "caution", "note": "Monitor autoimmune symptoms."}],
+      "risk": "Can stimulate immune activity",
+      "verbatim": "Use with caution; monitor autoimmune symptoms.",
+      "source": "03_contraindications.md#autoimmune"
+    },
+    {
+      "id": "CI-AI-4",
+      "trigger": {"conditions": ["active autoimmune disease", "autoimmune"], "medications": [], "population": null},
+      "restricted": [{"item": "Colostrum", "action": "avoid", "note": "Unless under supervision."}],
+      "risk": "Can flare immune reactivity",
+      "verbatim": "Avoid in active AI disease unless under supervision.",
+      "source": "03_contraindications.md#autoimmune"
+    },
+
+    {
+      "id": "CI-THY-1",
+      "trigger": {"conditions": ["Hashimoto's", "thyroid condition", "autoimmune thyroid", "hypothyroidism"], "medications": [], "population": null},
+      "restricted": [{"item": "Iodine", "action": "limit", "limit": "150 mcg", "note": "Selenium must be sufficient first. Only exceed if tested deficient."}],
+      "risk": "Can trigger Hashimoto's flare",
+      "verbatim": "Avoid high-dose iodine unless tested deficient. Selenium must be sufficient first.",
+      "source": "03_contraindications.md#thyroid"
+    },
+    {
+      "id": "CI-THY-2",
+      "trigger": {"conditions": ["hyperthyroidism", "Graves'", "thyroid condition"], "medications": [], "population": null},
+      "restricted": [{"item": "Ashwagandha", "action": "avoid", "note": "Avoid in hyperthyroid. OK in hypo with monitoring."}],
+      "risk": "Modulates thyroid hormones; may increase T3/T4",
+      "verbatim": "May increase T3/T4; avoid in hyperthyroid. OK in hypo with monitoring.",
+      "source": "03_contraindications.md#thyroid"
+    },
+    {
+      "id": "CI-THY-3",
+      "trigger": {"conditions": ["autoimmune thyroid", "Hashimoto's"], "medications": [], "population": null},
+      "restricted": [{"item": "Iron", "action": "test_first", "note": "Check ferritin (>70 optimal for thyroid). Avoid unnecessary iron in AI thyroid."}],
+      "risk": "Needed for T4→T3 conversion but not to be given unnecessarily in autoimmune thyroid",
+      "verbatim": "Check ferritin (>70 optimal for thyroid). Avoid unnecessary iron in AI thyroid.",
+      "source": "03_contraindications.md#thyroid"
+    },
+    {
+      "id": "CI-THY-4",
+      "trigger": {"conditions": ["Graves'", "hyperthyroidism", "thyroid condition"], "medications": ["thyroid medication"], "population": null},
+      "restricted": [{"item": "L-tyrosine", "action": "caution"}],
+      "risk": "Thyroid precursor amino acid",
+      "verbatim": "Use cautiously in Graves' or with active medication adjustment.",
+      "source": "03_contraindications.md#thyroid"
+    },
+    {
+      "id": "CI-THY-5",
+      "trigger": {"conditions": ["thyroid condition", "upcoming thyroid labs"], "medications": [], "population": null},
+      "restricted": [{"item": "Biotin", "action": "lab_interference", "note": "Discontinue at least 3 days before testing."}],
+      "risk": "Interferes with thyroid labs; can skew TSH, T3, T4 readings",
+      "verbatim": "Discontinue at least 3 days before testing. Can skew TSH, T3, T4 readings.",
+      "source": "03_contraindications.md#thyroid"
+    },
+
+    {
+      "id": "CI-OTH-1",
+      "trigger": {"conditions": ["estrogen dominance", "history of hormone-sensitive cancer", "breast cancer history"], "medications": [], "population": null},
+      "restricted": [
+        {"item": "DHEA", "action": "avoid"},
+        {"item": "Pregnenolone", "action": "avoid"},
+        {"item": "Maca", "action": "avoid"},
+        {"item": "Tribulus", "action": "avoid"}
+      ],
+      "risk": "Can worsen hormone-driven symptoms",
+      "verbatim": "Avoid unless hormone labs show clear deficiency and patient is not high risk.",
+      "source": "03_contraindications.md#other-cautions"
+    },
+    {
+      "id": "CI-OTH-2",
+      "trigger": {"conditions": [], "medications": ["SSRI", "MAOI", "psychiatric medication", "antidepressant"], "population": null},
+      "restricted": [
+        {"item": "5-HTP", "action": "avoid"},
+        {"item": "St. John's Wort", "action": "avoid"},
+        {"item": "SAMe", "action": "avoid"}
+      ],
+      "risk": "Risk of serotonin syndrome",
+      "verbatim": "Avoid unless cleared with prescribing psychiatrist.",
+      "source": "03_contraindications.md#other-cautions"
+    },
+    {
+      "id": "CI-OTH-3",
+      "trigger": {"conditions": ["IBD", "Crohn's", "ulcerative colitis", "gastritis", "active GI inflammation"], "medications": [], "population": null},
+      "restricted": [
+        {"item": "Iron", "action": "caution", "note": "Use chelated forms; consider iron bisglycinate."},
+        {"item": "NSAIDs", "action": "avoid"},
+        {"item": "Zinc sulfate", "action": "caution", "note": "Consider zinc picolinate instead."}
+      ],
+      "risk": "GI irritation",
+      "verbatim": "Use chelated forms; consider iron bisglycinate, zinc picolinate.",
+      "source": "03_contraindications.md#other-cautions"
+    },
+
+    {
+      "id": "CI-MED-1",
+      "trigger": {"conditions": [], "medications": ["warfarin", "Coumadin", "anticoagulant"], "population": null},
+      "restricted": [{"item": "Vitamin K2 (MK-4, MK-7)", "action": "avoid"}],
+      "risk": "Can antagonize warfarin",
+      "verbatim": "Vitamin K2 (MK-4, MK-7) — can antagonize warfarin.",
+      "source": "03_contraindications.md#anticoagulants"
+    },
+    {
+      "id": "CI-MED-2",
+      "trigger": {"conditions": [], "medications": ["warfarin", "Coumadin", "anticoagulant"], "population": null},
+      "restricted": [
+        {"item": "Fish oil", "action": "caution"},
+        {"item": "Vitamin E (≥400 IU)", "action": "caution"},
+        {"item": "Garlic", "action": "caution"},
+        {"item": "Ginkgo biloba", "action": "caution"},
+        {"item": "Ginger", "action": "caution"},
+        {"item": "Turmeric", "action": "caution"}
+      ],
+      "risk": "May increase bleeding risk",
+      "verbatim": "Fish oil, vitamin E (≥400 IU), garlic, ginkgo biloba, ginger, and turmeric — may increase bleeding risk.",
+      "source": "03_contraindications.md#anticoagulants"
+    },
+    {
+      "id": "CI-MED-3",
+      "trigger": {"conditions": [], "medications": ["warfarin", "Coumadin", "anticoagulant"], "population": null},
+      "restricted": [{"item": "CoQ10 (high dose)", "action": "caution"}],
+      "risk": "Structurally similar to vitamin K",
+      "verbatim": "High-dose CoQ10 (structurally similar to vitamin K) — use cautiously.",
+      "source": "03_contraindications.md#anticoagulants"
+    },
+    {
+      "id": "CI-MED-4",
+      "trigger": {"conditions": [], "medications": ["SSRI", "SNRI", "tricyclic", "MAOI", "antidepressant"], "population": null},
+      "restricted": [
+        {"item": "5-HTP", "action": "avoid"},
+        {"item": "Tryptophan", "action": "avoid"},
+        {"item": "St. John's Wort", "action": "avoid"},
+        {"item": "SAMe", "action": "avoid"}
+      ],
+      "risk": "Can increase serotonin dangerously",
+      "verbatim": "5-HTP, tryptophan, St. John's Wort, SAMe — can increase serotonin dangerously (especially with SSRIs/SNRIs).",
+      "source": "03_contraindications.md#antidepressants"
+    },
+    {
+      "id": "CI-MED-5",
+      "trigger": {"conditions": [], "medications": ["SSRI", "SNRI", "tricyclic", "MAOI", "antidepressant"], "population": null},
+      "restricted": [
+        {"item": "Ginkgo", "action": "caution"},
+        {"item": "Ginseng", "action": "caution"},
+        {"item": "Curcumin (high dose)", "action": "caution"}
+      ],
+      "risk": "May increase bleeding risk or interact with liver enzymes",
+      "verbatim": "Ginkgo, ginseng, high-dose curcumin — may increase bleeding risk or interact with liver enzymes.",
+      "source": "03_contraindications.md#antidepressants"
+    },
+    {
+      "id": "CI-MED-6",
+      "trigger": {"conditions": [], "medications": ["immunosuppressant", "corticosteroid", "methotrexate", "biologic"], "population": null},
+      "restricted": [
+        {"item": "Echinacea", "action": "avoid"},
+        {"item": "Astragalus", "action": "avoid"},
+        {"item": "Elderberry", "action": "avoid"},
+        {"item": "Medicinal mushrooms", "action": "avoid"}
+      ],
+      "risk": "Stimulate immune system",
+      "verbatim": "Echinacea, astragalus, elderberry, medicinal mushrooms — contraindicated (stimulate immune system).",
+      "source": "03_contraindications.md#immunosuppressants"
+    },
+    {
+      "id": "CI-MED-7",
+      "trigger": {"conditions": [], "medications": ["immunosuppressant", "corticosteroid", "methotrexate", "biologic", "chemotherapy"], "population": null},
+      "restricted": [{"item": "High-dose antioxidants", "action": "avoid", "note": "Unless approved by the treating physician."}],
+      "risk": "May counteract chemotherapy or immune suppression goals",
+      "verbatim": "High-dose antioxidants — may counteract chemotherapy or immune suppression goals.",
+      "source": "03_contraindications.md#immunosuppressants"
+    },
+    {
+      "id": "CI-MED-8",
+      "trigger": {"conditions": [], "medications": ["levothyroxine", "NDT", "thyroid medication"], "population": null},
+      "restricted": [
+        {"item": "Iron", "action": "separate", "note": "Space by 4 hours from thyroid medication."},
+        {"item": "Calcium", "action": "separate", "note": "Space by 4 hours from thyroid medication."},
+        {"item": "Magnesium", "action": "separate", "note": "Space by 4 hours from thyroid medication."},
+        {"item": "Fiber supplements", "action": "separate", "note": "Space by 4 hours from thyroid medication."}
+      ],
+      "risk": "Absorption interference",
+      "verbatim": "Space iron, calcium, magnesium, and fiber supplements by 4 hours from thyroid medication.",
+      "source": "03_contraindications.md#thyroid-medications"
+    },
+    {
+      "id": "CI-MED-9",
+      "trigger": {"conditions": ["positive thyroid antibodies"], "medications": ["levothyroxine", "NDT", "thyroid medication"], "population": null},
+      "restricted": [
+        {"item": "Ashwagandha", "action": "caution", "note": "Only if thyroid antibodies are negative."},
+        {"item": "Bladderwrack", "action": "caution", "note": "Only if thyroid antibodies are negative."},
+        {"item": "Licorice", "action": "caution", "note": "Only if thyroid antibodies are negative."}
+      ],
+      "risk": "Thyroid hormone modulation",
+      "verbatim": "Ashwagandha, bladderwrack, licorice — use cautiously and only if thyroid antibodies are negative.",
+      "source": "03_contraindications.md#thyroid-medications"
+    },
+    {
+      "id": "CI-MED-10",
+      "trigger": {"conditions": ["epilepsy", "seizure disorder"], "medications": ["anticonvulsant", "phenytoin", "carbamazepine"], "population": null},
+      "restricted": [
+        {"item": "Valerian", "action": "avoid"},
+        {"item": "Skullcap", "action": "avoid"},
+        {"item": "Kava", "action": "avoid"}
+      ],
+      "risk": "CNS effects",
+      "verbatim": "Avoid herbs with CNS effects (e.g. valerian, skullcap, kava).",
+      "source": "03_contraindications.md#anticonvulsants"
+    },
+    {
+      "id": "CI-MED-11",
+      "trigger": {"conditions": ["epilepsy", "seizure disorder"], "medications": ["anticonvulsant", "phenytoin", "carbamazepine"], "population": null},
+      "restricted": [
+        {"item": "Grapefruit extract", "action": "caution"},
+        {"item": "CBD", "action": "caution"},
+        {"item": "Curcumin", "action": "caution"}
+      ],
+      "risk": "May alter drug metabolism",
+      "verbatim": "Grapefruit extract, CBD, curcumin may alter drug metabolism.",
+      "source": "03_contraindications.md#anticonvulsants"
+    },
+    {
+      "id": "CI-MED-12",
+      "trigger": {"conditions": ["active cancer treatment"], "medications": ["chemotherapy", "radiation"], "population": null},
+      "restricted": [
+        {"item": "High-dose antioxidants", "action": "avoid", "note": "Unless approved by oncology."},
+        {"item": "Curcumin", "action": "avoid", "note": "Unless approved by oncology."},
+        {"item": "Resveratrol", "action": "avoid", "note": "Unless approved by oncology."},
+        {"item": "CoQ10", "action": "avoid", "note": "Unless approved by oncology."}
+      ],
+      "risk": "Oxidative stress interference during active treatment",
+      "verbatim": "High-dose antioxidants, curcumin, resveratrol, CoQ10 during active chemo/radiation unless approved.",
+      "source": "03_contraindications.md#chemotherapy"
+    },
+
+    {
+      "id": "CI-PREG-1",
+      "trigger": {"conditions": [], "medications": [], "population": "pregnancy"},
+      "restricted": [{"item": "Vitamin A (retinol)", "action": "limit", "limit": "total Vitamin A < 10,000 IU/day", "note": "Beta-carotene is safe alternative."}],
+      "risk": "Teratogenic risk",
+      "verbatim": "Beta-carotene is safe alternative; keep total Vitamin A < 10,000 IU/day",
+      "source": "03_contraindications.md#pregnancy"
+    },
+    {
+      "id": "CI-PREG-2",
+      "trigger": {"conditions": [], "medications": [], "population": "pregnancy"},
+      "restricted": [
+        {"item": "DIM", "action": "avoid"},
+        {"item": "Calcium-D-Glucarate", "action": "avoid"}
+      ],
+      "risk": "Hormonal detoxifiers; may interfere with essential hormone signaling in early pregnancy",
+      "verbatim": "May interfere with essential hormone signaling in early pregnancy",
+      "source": "03_contraindications.md#pregnancy"
+    },
+    {
+      "id": "CI-PREG-3",
+      "trigger": {"conditions": [], "medications": [], "population": "pregnancy"},
+      "restricted": [
+        {"item": "DHEA (high dose)", "action": "avoid"},
+        {"item": "Testosterone", "action": "avoid"},
+        {"item": "Androgens", "action": "avoid"}
+      ],
+      "risk": "Hormone disruption",
+      "verbatim": "Contraindicated; may cause virilization or miscarriage",
+      "source": "03_contraindications.md#pregnancy"
+    },
+    {
+      "id": "CI-PREG-4",
+      "trigger": {"conditions": [], "medications": [], "population": "pregnancy"},
+      "restricted": [
+        {"item": "Ashwagandha", "action": "avoid"},
+        {"item": "Rhodiola", "action": "avoid"},
+        {"item": "Herbal adaptogens (high dose)", "action": "avoid"}
+      ],
+      "risk": "Limited safety data; may affect uterine tone or hormone axis",
+      "verbatim": "May affect uterine tone or hormone axis; avoid unless guided",
+      "source": "03_contraindications.md#pregnancy"
+    },
+    {
+      "id": "CI-PREG-5",
+      "trigger": {"conditions": [], "medications": [], "population": "pregnancy"},
+      "restricted": [{"item": "Berberine", "action": "avoid"}],
+      "risk": "Uterine stimulant, potential toxicity",
+      "verbatim": "Use is not recommended in pregnancy",
+      "source": "03_contraindications.md#pregnancy"
+    },
+    {
+      "id": "CI-PREG-6",
+      "trigger": {"conditions": [], "medications": [], "population": "pregnancy"},
+      "restricted": [{"item": "NAC", "action": "avoid", "note": "Generally paused in first trimester; resume later under clinical supervision if indicated."}],
+      "risk": "Mixed data",
+      "verbatim": "Mixed data; generally paused in first trimester",
+      "source": "03_contraindications.md#pregnancy"
+    },
+    {
+      "id": "CI-PREG-7",
+      "trigger": {"conditions": [], "medications": [], "population": "pregnancy"},
+      "restricted": [{"item": "Curcumin (turmeric extract, high dose)", "action": "avoid", "note": "Culinary doses safe."}],
+      "risk": "Uterine stimulant at high doses",
+      "verbatim": "Culinary doses safe; avoid extract/supplements unless targeted use later in pregnancy",
+      "source": "03_contraindications.md#pregnancy"
+    },
+    {
+      "id": "CI-PREG-8",
+      "trigger": {"conditions": [], "medications": [], "population": "pregnancy"},
+      "restricted": [
+        {"item": "Detox protocols", "action": "avoid"},
+        {"item": "Saunas", "action": "avoid"},
+        {"item": "Binders", "action": "avoid"},
+        {"item": "Lymphatic drainage herbs", "action": "avoid"}
+      ],
+      "risk": "Mobilizes toxins; fetal toxin exposure risk",
+      "verbatim": "Avoid during pregnancy due to fetal toxin exposure risk",
+      "source": "03_contraindications.md#pregnancy"
+    },
+
+    {
+      "id": "CI-PED-1",
+      "trigger": {"conditions": [], "medications": [], "population": "pediatric"},
+      "restricted": [{"item": "Herbal supplements", "action": "avoid", "note": "Unless prescribed by pediatric-trained practitioner. Exceptions: chamomile, elderberry in safe doses."}],
+      "risk": "Not established as safe for children",
+      "verbatim": "Avoid unless prescribed by pediatric-trained practitioner (exceptions: chamomile, elderberry in safe doses).",
+      "source": "03_contraindications.md#children"
+    },
+    {
+      "id": "CI-PED-2",
+      "trigger": {"conditions": [], "medications": [], "population": "pediatric"},
+      "restricted": [
+        {"item": "Ashwagandha", "action": "avoid"},
+        {"item": "Rhodiola", "action": "avoid"},
+        {"item": "Adaptogens", "action": "avoid"}
+      ],
+      "risk": "Not studied for pediatric safety",
+      "verbatim": "Not studied for pediatric safety; use food-based stress support instead.",
+      "source": "03_contraindications.md#children"
+    },
+    {
+      "id": "CI-PED-3",
+      "trigger": {"conditions": [], "medications": [], "population": "pediatric"},
+      "restricted": [
+        {"item": "Glutathione", "action": "caution", "note": "Only under professional guidance."},
+        {"item": "NAC", "action": "caution", "note": "Only under professional guidance."}
+      ],
+      "risk": "Can unmask underlying issues if used too early or in wrong context",
+      "verbatim": "Only under professional guidance; can unmask underlying issues if used too early or in wrong context.",
+      "source": "03_contraindications.md#children"
+    },
+    {
+      "id": "CI-PED-4",
+      "trigger": {"conditions": [], "medications": [], "population": "pediatric"},
+      "restricted": [{"item": "Iron", "action": "test_first", "note": "Only if labs support need (ferritin <30 or low Hb)."}],
+      "risk": "Iron can cause constipation or GI upset",
+      "verbatim": "Only if labs support need (ferritin <30 or low Hb); iron can cause constipation or GI upset.",
+      "source": "03_contraindications.md#children"
+    },
+    {
+      "id": "CI-PED-5",
+      "trigger": {"conditions": [], "medications": [], "population": "pediatric"},
+      "restricted": [{"item": "Vitamin D", "action": "limit", "limit": "2000 IU without labs", "note": "Always test 25(OH)D levels in long-term use."}],
+      "risk": "Over-supplementation without lab confirmation",
+      "verbatim": "Always test 25(OH)D levels in long-term use; avoid >2000 IU without labs.",
+      "source": "03_contraindications.md#children"
+    },
+    {
+      "id": "CI-PED-6",
+      "trigger": {"conditions": [], "medications": [], "population": "pediatric"},
+      "restricted": [{"item": "Melatonin", "action": "limit", "limit": "0.5–2 mg, short-term only", "note": "Not for chronic use without addressing root cause of sleep issues."}],
+      "risk": "Chronic use masks root cause",
+      "verbatim": "Short-term use okay (0.5–2 mg); not for chronic use without addressing root cause of sleep issues.",
+      "source": "03_contraindications.md#children"
+    },
+    {
+      "id": "CI-PED-7",
+      "trigger": {"conditions": [], "medications": [], "population": "pediatric"},
+      "restricted": [{"item": "Essential oils (ingested)", "action": "avoid", "note": "Safe topically when diluted."}],
+      "risk": "Toxicity if ingested",
+      "verbatim": "Never ingest; safe topically when diluted (e.g., lavender for sleep, eucalyptus for congestion).",
+      "source": "03_contraindications.md#children"
+    },
+
+    {
+      "id": "CI-ELD-1",
+      "trigger": {"conditions": [], "medications": [], "population": "elderly"},
+      "restricted": [
+        {"item": "Fat-soluble vitamins", "action": "limit", "note": "Decrease dose."},
+        {"item": "NAC", "action": "limit", "note": "Decrease dose."},
+        {"item": "ALA", "action": "limit", "note": "Decrease dose."}
+      ],
+      "risk": "Reduced liver/kidney function",
+      "verbatim": "Elderly: Reduced liver/kidney function—decrease fat-soluble vitamin doses and detox-related compounds (e.g., NAC, ALA).",
+      "source": "03_contraindications.md#dosing-by-age-weight"
+    },
+
+    {
+      "id": "CI-IMM-1",
+      "trigger": {"conditions": ["autoimmune", "suspected autoimmunity", "MCAS", "early autoimmune"], "medications": [], "population": null},
+      "restricted": [{"item": "Immune boosters", "action": "avoid", "note": "Includes mushroom extracts, astragalus, colostrum used for priming."}],
+      "risk": "Worsens immune overactivation",
+      "verbatim": "Avoid immune boosters if autoimmunity suspected",
+      "source": "06_immune_priming.md#section-2-immune-priming-vs-immune-dampening"
+    },
+    {
+      "id": "CI-IMM-2",
+      "trigger": {"conditions": ["immune exhaustion", "frequent infections", "low WBC"], "medications": [], "population": null},
+      "restricted": [{"item": "Immune dampening agents", "action": "avoid", "note": "Quercetin, curcumin, LDN, boswellia used for dampening."}],
+      "risk": "Further suppresses an already underactive immune system",
+      "verbatim": "Avoid dampening if immune exhaustion present",
+      "source": "06_immune_priming.md#section-2-immune-priming-vs-immune-dampening"
+    },
+    {
+      "id": "CI-IMM-3",
+      "trigger": {"conditions": ["cow's milk protein allergy", "CMPA"], "medications": [], "population": null},
+      "restricted": [{"item": "Colostrum", "action": "avoid"}],
+      "risk": "Allergic reaction",
+      "verbatim": "Avoid in those with cow's milk protein allergy (CMPA).",
+      "source": "06_immune_priming.md#bovine-colostrum"
+    },
+
+    {
+      "id": "CI-GUT-1",
+      "trigger": {"conditions": ["gastritis", "ulcers", "active GI inflammation"], "medications": ["NSAIDs"], "population": null},
+      "restricted": [{"item": "Betaine HCl with pepsin", "action": "avoid"}],
+      "risk": "Aggravates gastritis and ulcers",
+      "verbatim": "Betaine HCl with pepsin (if no gastritis, ulcers, or NSAID use).",
+      "source": "04_gut_repair_5r.md#phase-2-replace-weeks-26-overlaps-with-remove"
+    },
+    {
+      "id": "CI-GUT-2",
+      "trigger": {"conditions": ["SIBO", "suspected SIBO"], "medications": [], "population": null},
+      "restricted": [
+        {"item": "Prebiotics (inulin, FOS, GOS, resistant starch)", "action": "test_first", "note": "Test for SIBO first."},
+        {"item": "Fiber supplements", "action": "caution", "note": "Introduce slowly to prevent bloating."}
+      ],
+      "risk": "Feeds bacterial overgrowth",
+      "verbatim": "Avoid if SIBO is active or suspected (test first).",
+      "source": "04_gut_repair_5r.md#phase-3-reinoculate-weeks-48"
+    }
+  ]
+}

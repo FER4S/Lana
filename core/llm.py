@@ -38,10 +38,20 @@ REQUEST_TIMEOUT: float = 10.0
 # says nothing about who the boss is: their name/clinic/role live in
 # profile.json and reach every call via memory_context, so those details have
 # exactly one home.
+# Self-trigger guard (the last sentence): the wake word is "Hey Lana" and the
+# barge-in detector listens while Lana speaks, so the boss can interrupt her.
+# The wake model was trained on the same Kokoro voice she speaks with, so if she
+# says her own name aloud it bleeds from the speakers into the mic and fires the
+# wake word, cutting her off (verified live at score 0.681 on "I'm Lana"). The
+# instruction below must stay part of the STRING, not a comment.
 SYSTEM_PROMPT: str = (
     "You are Lana, a helpful voice assistant. "
     "Keep responses short and conversational since they will be spoken aloud. "
-    "Avoid bullet points, markdown, or any formatting — plain sentences only."
+    "Avoid bullet points, markdown, or any formatting — plain sentences only. "
+    "Never say the word \"Lana\" or the phrase \"hey Lana\" out loud: refer to "
+    "yourself only as \"I\" and never state or introduce your own name, because "
+    "hearing your name through the speakers falsely triggers the wake word and "
+    "cuts you off."
 )
 
 # Fallback replies for each error category

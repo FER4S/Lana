@@ -47,6 +47,14 @@ from core.memory import (
     STRUCTURE_KIND_FACT,
     is_valid_email,
 )
+from core.plan_manager import (
+    CONFIRM_NO as PLAN_CONFIRM_NO,
+    CONFIRM_REVISE as PLAN_CONFIRM_REVISE,
+    CONFIRM_YES as PLAN_CONFIRM_YES,
+    INTENT_TREATMENT_PLAN,
+    REFERRAL_DRAFT,
+    PlanManager,
+)
 from core.stt import STTEngine
 from core.tts import TTSEngine
 from core.wake_word import WakeWordDetector
@@ -77,8 +85,11 @@ ADDRESS_ENTRY_SILENCE_TIMEOUT: float = 15.0
 # here interrupts speech mid-sentence, so it should be harder to fire than a
 # normal wake. NOTE (Lana): hey_lana.onnx was trained on Kokoro-synthesized
 # audio and the TTS voice is also Kokoro, so self-trigger risk is higher than on
-# Jarvis — run the self-trigger soak test and raise this if the voice trips it.
-BARGE_IN_THRESHOLD: float = 0.6
+# Jarvis. Two mitigations are in place: the LLM system prompt forbids Lana from
+# saying her own name (the strongest self-trigger — verified live at score 0.681
+# on "I'm Lana"), and this threshold is env-tunable (config.BARGE_IN_THRESHOLD /
+# .env) so it can be raised on a speaker setup without editing code.
+BARGE_IN_THRESHOLD: float = config.BARGE_IN_THRESHOLD
 
 # Trigger phrases that mark an explicit "remember this" voice command.
 MEMORY_TRIGGER_PHRASES: tuple[str, ...] = ("remember that", "don't forget")
@@ -106,6 +117,71 @@ EMAIL_KEYWORDS: frozenset[str] = frozenset({
 # request gets before Lana offers to just show everything matching what's
 # known so far, instead of asking indefinitely.
 MAX_SEARCH_REFINEMENT_ROUNDS: int = 3
+
+# ── Treatment-plan gate + bounds ─────────────────────────────────────────────
+# Words that gate a turn into treatment-plan intent classification, checked
+# BEFORE the email gate — EMAIL_KEYWORDS contains "draft", "send" and "read", so
+# "draft a plan for this patient" would otherwise be claimed as an email turn.
+# The plan gate is the narrower of the two, so it gets first refusal.
+#
+# Matched as whole TOKENS, unlike EMAIL_KEYWORDS' substring test: "case" is a
+# substring of "because" and "plan" of "planet"/"planning", and this gate is
+# evaluated on every single turn. A false positive only costs one fast Haiku
+# call that resolves to not_plan and falls through to the email gate, but
+# "because" is common enough to be worth not paying for.
+PLAN_KEYWORDS: frozenset[str] = frozenset({
+    "plan", "plans", "protocol", "protocols", "patient", "patients",
+    "case", "cases", "treatment", "refer", "referral", "supplement",
+    "supplements", "client", "clients", "dosing", "consult",
+})
+
+# How long to wait for Alexandra to START a segment while dictating a case.
+# The longest window in the codebase, alongside the send confirmation, and for
+# the same reason: recalling a patient's history is thinking, not reacting.
+# core/stt.py caps ONE recording at MAX_DURATION_S (30s) and ends it after
+# SILENCE_DURATION_S (2s) of quiet, so a dictated case necessarily arrives as
+# several segments — this bounds the gap between them, not the case.
+CASE_DICTATION_SILENCE_TIMEOUT: float = 15.0
+
+# Belt and braces on the dictation loop: a stuck mic returning endless empty
+# transcriptions must not spin forever, and a case far past this length is a
+# malfunction, not a consult.
+MAX_CASE_SEGMENTS: int = 40
+CASE_CHAR_LIMIT: int = 12_000
+
+# "Add zinc to phase two" rounds before Lana stops re-drafting. Unlike the send
+# flow, exhausting this is not dangerous — it exits toward saving the draft she
+# already approved-in-spirit rather than toward discarding her dictation.
+MAX_PLAN_REVISION_ROUNDS: int = 3
+# Garbled answers to "save this draft?" before Lana stops asking. Note the safe
+# direction is INVERTED relative to the send flow: see _confirm_and_save_plan.
+MAX_PLAN_CONFIRM_ROUNDS: int = 2
+# Referral flags read aloud in full before Lana summarizes the rest by count.
+# Every flag always reaches the document; this only bounds the spoken preamble,
+# because a case matching seven criteria read out one by one is a case she stops
+# listening to halfway through.
+MAX_SPOKEN_REFERRAL_FLAGS: int = 4
+
+# Below this, the assembled case is treated as "the mic didn't work", not as a
+# thin case. Clinical sufficiency is NOT judged here — that is screen_case's
+# missing_safety_fields, which reasons about what this case actually needs.
+MIN_CASE_CHARS: int = 60
+
+# Spoken phrases that end case dictation. Anchored to the END of a segment (see
+# _strip_case_done_phrase) so "that's it for her medications, now her labs…"
+# doesn't cut the case off mid-dictation.
+#
+# Deliberately short and unambiguous. A bare "done" or "go ahead" would also be
+# natural here, but they end ordinary clinical sentences too ("her workup is
+# done", "her GP said to go ahead") — and a false positive silently TRUNCATES A
+# PATIENT CASE, dropping whatever she said next. The cost of omitting them is
+# 15 seconds of extra listening before the silence window ends dictation anyway.
+_CASE_DONE_PHRASES: tuple[str, ...] = (
+    "that's it", "thats it", "that's all", "thats all",
+    "that's everything", "thats everything",
+    "that's the case", "thats the case", "that's the lot", "thats the lot",
+    "i'm done", "im done", "i am done", "end of case", "over to you",
+)
 
 # ── Send-flow bounds ─────────────────────────────────────────────────────────
 # Every loop in the send sub-dialogue is bounded, and every bound exits toward
@@ -259,6 +335,12 @@ class LanaAssistant:
 
         self._email = EmailManager(on_new_mail=self._on_new_mail)
 
+        # Treatment-plan drafting. Construction is cheap and touches no disk
+        # (same split as MemoryManager/PlanKnowledge); run() calls load().
+        # Deliberately has NO delivery path — its only side effect is writing a
+        # markdown file under data/treatment_plans/ (see core/plan_manager.py).
+        self._plan = PlanManager()
+
         # The wake word detector callback just signals the main thread — it must
         # not do any heavy work itself to avoid blocking the detector's internal
         # thread.
@@ -343,6 +425,18 @@ class LanaAssistant:
         """
         return self._email
 
+    def get_plan_manager(self) -> PlanManager:
+        """
+        Exposes the shared PlanManager, for api/server.py's READ-ONLY plan
+        endpoints (corpus provenance and the saved-draft folder).
+
+        There is no singleton hazard here as there is with EmailManager — a
+        PlanManager owns no thread, no poller and no cache file — but binding
+        to this instance avoids re-parsing the whole corpus, and guarantees the
+        API reports the provenance of the corpus that actually drafted.
+        """
+        return self._plan
+
     def _set_state(self, new_state: AssistantState) -> None:
         self._state = new_state
 
@@ -370,7 +464,11 @@ class LanaAssistant:
             self._stop_requested = False
 
         try:
-            # Load Whisper and Kokoro models once at startup
+            # Load Whisper and Kokoro models once at startup. This model-load
+            # order is not what mattered for the torch/ctranslate2 GPU-coexistence
+            # crash — that is fixed by the import-order guard at the top of
+            # core/stt.py (torch must load its CUDA DLLs before ctranslate2).
+            # With that in place either model-load order is safe on the GPU.
             logger.info("Loading Whisper model (first-time may download weights)…")
             self._stt.load_model()
             logger.success("Whisper model ready.")
@@ -386,6 +484,18 @@ class LanaAssistant:
             logger.info("Loading email account store…")
             self._email.initialize()
             logger.success("Email manager ready.")
+
+            # Treatment-plan knowledge. A failure here disables ONLY plan
+            # drafting (Lana says so when asked) — it must never stop the voice
+            # pipeline coming up, exactly like a missing profile.json doesn't.
+            logger.info("Loading treatment-plan knowledge…")
+            if self._plan.load():
+                logger.success("Treatment-plan knowledge ready.")
+            else:
+                logger.error(
+                    f"Treatment-plan drafting is UNAVAILABLE: "
+                    f"{self._plan.unavailable_reason}"
+                )
 
             # A stop() that arrived while models were loading must win —
             # don't bring the wake loop up at all.
@@ -618,6 +728,680 @@ class LanaAssistant:
             # the information is recorded.
             self._memory.add_event(description, date, force_new=(verdict == "new"))
             self._speak_confirmation("Got it — I've noted that event.")
+
+    # ── Treatment plans ───────────────────────────────────────────────────────
+    #
+    # The plan_* events below are EMIT-ONLY. Nothing in this process reads
+    # them: _emit_event is a queue.put, and api/server.py's broadcaster is the
+    # only consumer. They exist so a frontend can show what stage a draft is at
+    # and which of Alexandra's own rules fired — none of which is inferable
+    # from the llm_response/transcription stream this flow otherwise produces.
+    #
+    # Because they are emit-only, no event here may alter control flow, and no
+    # emit may raise: a failure to describe the plan must never become a
+    # failure to draft it. See _with_rule_text for the one lookup involved.
+
+    def _with_rule_text(self, entries: list[dict]) -> list[dict]:
+        """
+        Copy screening flags / check violations for the event stream, adding
+        the rule's OWN WORDS alongside the model's one-line summary.
+
+        This is the whole point of the payload: a frontend showing
+        "matched_because: patient is on warfarin" is showing model output,
+        while one that also quotes the verbatim criterion is showing
+        Alexandra's own documentation. Same lookup _speak_referral_flags uses.
+
+        An id missing from the rulebook simply contributes no verbatim rather
+        than raising. _coerce_screening already drops unknown ids, but this
+        runs on the emit path, where an exception would cost a draft.
+        """
+        annotated: list[dict] = []
+        for entry in entries:
+            item = dict(entry)
+            rule = self._plan.knowledge.rule(str(entry.get("rule_id", "")))
+            if rule is not None:
+                item["verbatim"] = rule.get("verbatim", "")
+                item["refer_to"] = rule.get("refer_to", "")
+                item["kind"] = rule.get("kind", "")
+            annotated.append(item)
+        return annotated
+
+    def _maybe_handle_plan_request(self, text: str) -> bool:
+        """
+        Intercepts one turn if it's a request to draft a treatment plan.
+        Returns True if handled (the caller `continue`s the turn loop without
+        touching self._llm) — the same contract as _maybe_handle_email_query.
+
+        Runs BEFORE the email intercept. EMAIL_KEYWORDS contains "draft",
+        "send" and "read", so "draft a plan for this patient" hits the email
+        gate too; the plan gate is the narrower of the two and so gets first
+        refusal. The reverse confusion is handled inside the classifier, whose
+        prompt is explicit that anything about email is not_plan — so "draft an
+        email to the lab about Sarah's treatment plan" falls through to here
+        returning False and reaches the email intercept unharmed.
+
+        Takes NO email_ctx, on purpose: unlike the reading flow there is no
+        cross-turn plan state at all (see _handle_treatment_plan).
+
+        A classifier failure always resolves to not_plan, so a hiccup can never
+        hijack a turn.
+        """
+        tokens = set(re.findall(r"[a-z]+", text.lower()))
+        if not (tokens & PLAN_KEYWORDS):
+            return False
+
+        self._set_state(AssistantState.THINKING)
+        parsed = self._plan.classify_plan_intent(text)
+        if parsed["intent"] != INTENT_TREATMENT_PLAN:
+            return False
+
+        self._handle_treatment_plan(text, parsed["patient_hint"])
+        return True
+
+    @staticmethod
+    def _strip_case_done_phrase(segment: str) -> tuple[str, bool]:
+        """
+        Split a dictated segment into (clinical content, dictation finished?).
+
+        A terminator only counts at the END of a segment, so a mid-case
+        "that's it for her medications, now her labs…" keeps dictating. When
+        one is found, the same number of trailing words is cut from the
+        ORIGINAL string rather than the normalized one, so the case keeps its
+        punctuation and casing.
+        """
+        normalized = " ".join(re.sub(r"[^a-z' ]+", " ", segment.lower()).split())
+        for phrase in _CASE_DONE_PHRASES:
+            if normalized == phrase:
+                return "", True
+            if normalized.endswith(" " + phrase):
+                words = segment.split()
+                keep = max(len(words) - len(phrase.split()), 0)
+                return " ".join(words[:keep]).rstrip(" ,.;:—-"), True
+        return segment, False
+
+    def _capture_case(self, opening_text: str, patient_hint: str | None) -> str:
+        """
+        Collect a dictated patient case across as many spoken segments as it
+        takes. Returns the assembled case, or "" if it was abandoned (having
+        already told her nothing was kept).
+
+        core/stt.py ends a recording after SILENCE_DURATION_S (2s) of quiet and
+        caps it at MAX_DURATION_S (30s), so a case dictated at consult pace
+        ALWAYS arrives in pieces. This stitches them back together: it speaks
+        the prompt once and then listens repeatedly with NO speech in between,
+        so she can pause to think mid-sentence without Lana talking over her.
+
+        This is also why case dictation never passes through the turn loop —
+        which is what keeps every one of these segments out of
+        self._llm.history, and so out of memory extraction.
+        """
+        # Emitted before the prompt, so a frontend can start stitching the
+        # per-segment `transcription` events below into one dictation block
+        # rather than rendering them as N separate conversational turns.
+        self._emit_event("plan_stage", stage="dictating")
+
+        who = f" — this is for {patient_hint}" if patient_hint else ""
+        self._speak_confirmation(
+            f"Go ahead{who}. Tell me about the case; take your time, pauses are "
+            "fine. Say \"that's it\" when you've finished."
+        )
+
+        segments: list[str] = []
+        opening = _clean(opening_text)
+        if opening:
+            # Seed with the utterance that triggered this. It routinely carries
+            # the case itself ("draft a plan for a 34-year-old with SIBO, on
+            # metformin"), and dropping it would silently lose all of that.
+            segments.append(opening)
+
+        for _ in range(MAX_CASE_SEGMENTS):
+            self._set_state(AssistantState.LISTENING)
+            self._emit_event("listening_started")
+            logger.info(
+                f"[Plan] Listening for case dictation "
+                f"(segment {len(segments)}, {CASE_DICTATION_SILENCE_TIMEOUT:.0f}s window)…"
+            )
+            segment = self._stt.listen_and_transcribe(
+                initial_silence_timeout=CASE_DICTATION_SILENCE_TIMEOUT
+            ).strip()
+
+            if not segment:
+                break  # a whole silent window means she's finished talking
+
+            self._emit_event("transcription", text=segment)
+
+            if _is_cancel(segment):
+                self._speak_confirmation(
+                    "Alright — I've dropped that. Nothing was saved."
+                )
+                return ""
+
+            body, finished = self._strip_case_done_phrase(segment)
+            if body:
+                segments.append(body)
+            if finished:
+                break
+
+            if sum(len(s) for s in segments) >= CASE_CHAR_LIMIT:
+                logger.warning("[Plan] Case dictation hit CASE_CHAR_LIMIT — capture stopped.")
+                break
+
+        case_text = "\n".join(segments).strip()
+        if len(case_text) < MIN_CASE_CHARS:
+            self._speak_confirmation(
+                "I didn't catch enough of that to work from, so I haven't saved "
+                "anything. Give me a shout when you want to try again."
+            )
+            return ""
+
+        logger.info(
+            f"[Plan] Case captured: {len(segments)} segment(s), {len(case_text)} chars."
+        )
+        return case_text
+
+    def _handle_treatment_plan(self, opening_text: str, patient_hint: str | None) -> None:
+        """
+        The treatment-plan sub-dialogue: capture → screen → referral gate →
+        draft → contraindication check → confirm → save.
+
+        SELF-CONTAINED, exactly like the send flow. It drives its own
+        speak/listen rounds and returns only once a file has been written, the
+        case has been abandoned, or a stage failed closed. Nothing is stored on
+        `self`, and email_ctx is not even passed in — so there is no cross-turn
+        plan state to lose, leak, or re-route. A confirmation answer never
+        round-trips through classify_intent, so "save it" can never come back
+        as read_email.
+
+        PATIENT DATA NEVER REACHES PERSISTENT MEMORY. This handler
+        short-circuits the turn, so the case is never passed to
+        self._llm.get_response() and never enters self._llm.history — which is
+        the only thing _run_conversation's finally block hands to memory
+        extraction. Every case string here lives in a local and dies with the
+        call. Do not add a self._memory write to this path, and do not route
+        case text through the LLM engine.
+
+        The one durable artifact is a markdown file under data/treatment_plans/
+        (git-ignored), written by PlanManager, which has no delivery path.
+        """
+        if not self._plan.available:
+            logger.error(
+                f"[Plan] Requested but unavailable: {self._plan.unavailable_reason}"
+            )
+            self._speak_confirmation(
+                "I can't draft treatment plans at the moment — my copy of your "
+                "clinical documents didn't load properly. Worth checking the logs."
+            )
+            self._emit_event("plan_ended", outcome="unavailable")
+            return
+
+        self._emit_event("plan_started", patient_hint=patient_hint)
+
+        case_text = self._capture_case(opening_text, patient_hint)
+        if not case_text:
+            self._emit_event("plan_ended", outcome="abandoned")
+            return  # _capture_case already explained why
+
+        # ── Screening. FAIL-CLOSED: no screening means no draft, ever. ────────
+        self._emit_event("plan_stage", stage="screening")
+        self._speak_confirmation(
+            "Let me check this against your referral criteria — one moment."
+        )
+        self._set_state(AssistantState.THINKING)
+        screening = self._plan.screen_case(case_text)
+        if screening is None:
+            # The difference between this and a wellness protocol for a case
+            # that needed a referral is the whole point of the design.
+            self._speak_confirmation(
+                "I couldn't screen that case against your criteria, so I'm not "
+                "going to draft anything from it. Nothing has been saved — "
+                "you'll want to look at this one yourself."
+            )
+            self._emit_event("plan_ended", outcome="failed")
+            return
+
+        self._emit_event(
+            "plan_screened",
+            patient_label=screening["patient_label"],
+            plan_type=screening["plan_type"],
+            referral_flags=self._with_rule_text(screening["referral_flags"]),
+            applicable_rule_ids=list(screening["applicable_rule_ids"]),
+            missing_safety_fields=list(screening["missing_safety_fields"]),
+            uncovered_topics=list(screening["uncovered_topics"]),
+        )
+
+        # ── Referral gate — a flagged case gets a memo, not a plan, by default ─
+        if screening["referral_flags"]:
+            if not self._offer_plan_after_referral(screening, case_text):
+                return
+
+        drafted = self._draft_and_check(case_text, screening)
+        if drafted is None:
+            return  # _draft_and_check already explained why
+
+        self._confirm_and_save_plan(case_text, screening, drafted)
+
+    def _offer_plan_after_referral(self, screening: dict, case_text: str) -> bool:
+        """
+        Speak the referral flags, then ask whether to draft supportive care
+        alongside the referral.
+
+        Returns True ONLY on a clear ask to draft. Every other answer — just the
+        note, silence, a garble — saves a referral memo instead and returns
+        False. A flagged case not getting a plan is the DEFAULT outcome here,
+        not an error path, so every way out of this method except one leads away
+        from drafting.
+
+        Uses classify_referral_followup, NOT classify_plan_confirmation: the
+        natural affirmative to THIS question is "draft the supportive care as
+        well", which the save-this-draft classifier misreads as an edit and so
+        never drafts (a real bug that saved a memo when a plan was asked for).
+        The dedicated classifier still fails closed — only REFERRAL_DRAFT draws
+        a plan; note/unclear/silence/exception all keep the memo default.
+        """
+        self._speak_referral_flags(screening["referral_flags"])
+
+        self._emit_event("plan_stage", stage="confirming")
+        answer = self._ask_and_listen(
+            "Do you want me to draft supportive care alongside the referral, "
+            "or just save the referral note?",
+            silence_timeout=SEND_CONFIRM_SILENCE_TIMEOUT,
+        )
+        self._set_state(AssistantState.THINKING)
+        if self._plan.classify_referral_followup(answer) == REFERRAL_DRAFT:
+            logger.info("[Plan] Referral flagged; drafting supportive care on her say-so.")
+            return True
+
+        memo = self._plan.render_referral_memo(screening, case_text)
+        path = self._plan.save_referral_memo(memo, screening["patient_label"])
+        if path is None:
+            self._speak_confirmation(
+                "I couldn't write the referral note to disk — nothing was saved. "
+                "The flags are in the logs."
+            )
+            self._emit_event("plan_ended", outcome="failed")
+            return False
+
+        self._speak_confirmation(
+            f"I've saved a referral note in your treatment plans folder, as "
+            f"{os.path.basename(path)}. No treatment plan was drafted. It's a "
+            "draft and hasn't been clinically reviewed."
+        )
+        self._emit_event(
+            "plan_saved",
+            filename=os.path.basename(path),
+            kind="referral_memo",
+            unsure=False,
+        )
+        self._emit_event("plan_ended", outcome="saved")
+        return False
+
+    def _speak_referral_flags(self, flags: list[dict]) -> None:
+        """
+        Read the referral flags aloud, confident ones first.
+
+        Both halves are always surfaced — the split is presentation, never
+        substance, and an empty confident list must never be spoken as "no
+        referral". Only the spoken preamble is capped: every flag reaches the
+        rendered document regardless.
+        """
+        confident, possible = self._plan.split_flags_by_confidence(flags)
+
+        lines: list[str] = []
+        if confident:
+            matched = (
+                "a referral criterion" if len(confident) == 1
+                else f"{len(confident)} referral criteria"
+            )
+            lines.append(f"This case matches {matched} in your own documentation.")
+        else:
+            lines.append(
+                "Nothing here squarely meets a referral criterion, but some "
+                "partial matches are worth your eye."
+            )
+
+        for flag in (confident + possible)[:MAX_SPOKEN_REFERRAL_FLAGS]:
+            rule = self._plan.knowledge.rule(flag["rule_id"])
+            if rule is None:
+                continue
+            action = (
+                f"refer to {rule.get('refer_to', '')}"
+                if rule.get("kind", "refer_out") == "refer_out"
+                else f"test first — {rule.get('refer_to', '')}"
+            )
+            hedge = "possibly, " if flag.get("confidence") == "possible" else ""
+            lines.append(f"{hedge}{action}: {flag.get('matched_because', '')}")
+
+        remaining = len(confident) + len(possible) - MAX_SPOKEN_REFERRAL_FLAGS
+        if remaining > 0:
+            lines.append(f"There are {remaining} more, all written up in the note.")
+
+        self._speak_confirmation(sanitize_body_text(" ".join(lines)))
+
+    def _draft_and_check(self, case_text: str, screening: dict) -> dict | None:
+        """
+        Draft the plan and run the post-draft contraindication check, with one
+        automatic attempt to clear any violation found.
+
+        Returns {"draft", "violations", "check_ran", "warnings"}, or None if
+        drafting failed outright (having already said so).
+
+        The re-draft is adopted ONLY if its own re-check actually ran AND found
+        strictly fewer violations. Anything else keeps the original draft with
+        its violations intact, so the renderer shows her a real problem rather
+        than an unverified replacement for one.
+        """
+        unresolved = screening["missing_safety_fields"]
+
+        self._emit_event("plan_stage", stage="drafting")
+        self._speak_confirmation(
+            "Right — I'll draft it now. Give me a minute or two."
+        )
+        self._set_state(AssistantState.THINKING)
+        draft = self._plan.draft_plan(case_text, screening, unresolved_fields=unresolved)
+        if draft is None:
+            self._speak_confirmation(
+                "The draft didn't come back cleanly, so there's nothing saved. "
+                "Ask me again and I'll have another go."
+            )
+            self._emit_event("plan_ended", outcome="failed")
+            return None
+
+        self._emit_event("plan_stage", stage="checking")
+        self._set_state(AssistantState.THINKING)
+        check = self._plan.check_draft(draft, case_text, screening)
+        violations, check_ran = check["violations"], check["checked"]
+        auto_cleared = False
+
+        if violations:
+            logger.warning(
+                f"[Plan] Post-draft check found {len(violations)} violation(s) — "
+                f"attempting one automatic clearing pass."
+            )
+            self._emit_event("plan_stage", stage="revising")
+            self._speak_confirmation(
+                "The safety check caught something in that draft — fixing it now."
+            )
+            self._set_state(AssistantState.THINKING)
+            instruction = "Remove or replace these, which violate a contraindication rule in force for this patient: " + "; ".join(
+                f"{v['item']} in {v['phase']} ({v['rule_id']}: {v['explanation']})"
+                for v in violations
+            )
+            revised = self._plan.draft_plan(
+                case_text, screening, unresolved_fields=unresolved,
+                prior_draft=draft, revision=instruction,
+            )
+            if revised is not None:
+                self._emit_event("plan_stage", stage="checking")
+                self._set_state(AssistantState.THINKING)
+                recheck = self._plan.check_draft(revised, case_text, screening)
+                if recheck["checked"] and len(recheck["violations"]) < len(violations):
+                    draft = revised
+                    violations, check_ran = recheck["violations"], True
+                    auto_cleared = True
+
+        result = {
+            "draft": draft,
+            "violations": violations,
+            "check_ran": check_ran,
+            "warnings": self._plan.validate_draft(draft),
+        }
+        self._emit_plan_draft(result, auto_cleared=auto_cleared)
+        return result
+
+    def _emit_plan_draft(self, drafted: dict, auto_cleared: bool = False) -> None:
+        """
+        Describe a finished draft and its safety check to the event stream.
+
+        Re-emitted after every revision, so a frontend always reflects the
+        draft currently on the table rather than the first one drafted.
+
+        Carries the SHAPE of the plan, not its contents: the document itself is
+        served from disk once saved (GET /plans/{filename}), and there is no
+        reason to push a whole treatment plan through the socket twice. The
+        contraindication violations DO travel in full, with the rule's own
+        words attached — an unresolved violation is the one thing a reviewer
+        must not have to go looking for.
+        """
+        draft = drafted["draft"]
+        goals = draft.get("goals_timeline") or {}
+        phases = [p for p in (draft.get("phases") or []) if isinstance(p, dict)]
+
+        self._emit_event(
+            "plan_drafted",
+            phase_count=len(phases),
+            total_months=_clean(goals.get("total_months")),
+            phases=[
+                {
+                    "name": _clean(phase.get("name")) or "Phase",
+                    "duration_weeks": _clean(phase.get("duration_weeks")),
+                    "supplement_count": len(phase.get("supplements") or []),
+                }
+                for phase in phases
+            ],
+        )
+        self._emit_event(
+            "plan_checked",
+            check_ran=drafted["check_ran"],
+            auto_cleared=auto_cleared,
+            violations=self._with_rule_text(drafted["violations"]),
+        )
+
+    def _confirm_and_save_plan(
+        self, case_text: str, screening: dict, drafted: dict
+    ) -> None:
+        """
+        Summarize the draft aloud, then save it or revise it on her word.
+
+        NOTE THE INVERTED SAFE DIRECTION. In the send flow, exhausting the
+        unclear allowance cancels, because a sent email cannot be recalled.
+        Here the artifact is an inert file stamped DRAFT — PENDING ALEXANDRA'S
+        REVIEW that no patient will ever see, while the thing that IS
+        unrecoverable is several minutes of dictated case. So an exhausted
+        unclear SAVES and says so plainly. classify_plan_confirmation stays
+        strict about what counts as yes/no/revise; this is the caller's
+        judgment about which way to fail, and it is deliberate.
+        """
+        revisions = 0
+
+        while True:
+            self._emit_event("plan_stage", stage="confirming")
+            self._speak_confirmation(self._summarize_plan_for_speech(screening, drafted))
+            answer = self._ask_and_listen(
+                "Do you want me to save that as a draft for your review, or "
+                "change something first?",
+                silence_timeout=SEND_CONFIRM_SILENCE_TIMEOUT,
+            )
+            self._set_state(AssistantState.THINKING)
+            verdict = self._plan.classify_plan_confirmation(answer)
+
+            # Each freshly-summarized draft gets its own unclear allowance.
+            unclear_rounds = 0
+            while verdict not in (PLAN_CONFIRM_YES, PLAN_CONFIRM_NO, PLAN_CONFIRM_REVISE):
+                unclear_rounds += 1
+                if unclear_rounds >= MAX_PLAN_CONFIRM_ROUNDS:
+                    logger.info("[Plan] Confirmation unclear — saving rather than discarding.")
+                    self._save_and_announce(screening, drafted, case_text, unsure=True)
+                    return
+                answer = self._ask_and_listen(
+                    "Sorry — shall I save that draft? Yes or no.",
+                    silence_timeout=SEND_CONFIRM_SILENCE_TIMEOUT,
+                )
+                self._set_state(AssistantState.THINKING)
+                verdict = self._plan.classify_plan_confirmation(answer)
+
+            if verdict == PLAN_CONFIRM_NO:
+                self._speak_confirmation(
+                    "Alright — I've thrown that one away. Nothing was saved."
+                )
+                self._emit_event("plan_ended", outcome="discarded")
+                return
+
+            if verdict == PLAN_CONFIRM_REVISE:
+                revisions += 1
+                if revisions > MAX_PLAN_REVISION_ROUNDS:
+                    # Exhaustion still exits toward keeping her work, not
+                    # binning it — she can edit the file by hand.
+                    self._speak_confirmation(
+                        "I'm not getting those changes right, so I'll save what "
+                        "I've got and you can take it from there."
+                    )
+                    self._save_and_announce(screening, drafted, case_text)
+                    return
+
+                self._emit_event("plan_stage", stage="revising")
+                # Warn about the wait: a revision re-drafts and re-checks the
+                # whole plan (not a quick insert), so it takes as long as the
+                # first draft. Without this, the minute-plus of silence reads as
+                # a freeze.
+                self._speak_confirmation(
+                    "Sure — I'll rework the whole plan and re-run the safety "
+                    "check so the change is safe. Give me a minute or two."
+                )
+                self._set_state(AssistantState.THINKING)
+                revised = self._plan.draft_plan(
+                    case_text, screening,
+                    unresolved_fields=screening["missing_safety_fields"],
+                    prior_draft=drafted["draft"], revision=answer,
+                )
+                if revised is None:
+                    self._speak_confirmation(
+                        "That revision didn't come back — I'll keep the version "
+                        "I already had."
+                    )
+                    self._save_and_announce(screening, drafted, case_text)
+                    return
+
+                # Re-check every revision: an edit can introduce a
+                # contraindicated item as easily as remove one.
+                self._emit_event("plan_stage", stage="checking")
+                self._set_state(AssistantState.THINKING)
+                recheck = self._plan.check_draft(revised, case_text, screening)
+                drafted = {
+                    "draft": revised,
+                    "violations": recheck["violations"],
+                    "check_ran": recheck["checked"],
+                    "warnings": self._plan.validate_draft(revised),
+                }
+                self._emit_plan_draft(drafted)
+                continue  # summarize the revised draft and ask again
+
+            self._save_and_announce(screening, drafted, case_text)
+            return
+
+    def _save_and_announce(
+        self, screening: dict, drafted: dict, case_text: str, unsure: bool = False
+    ) -> None:
+        """
+        Render and write the draft, then say where it went.
+
+        The spoken line ALWAYS states that it is an unreviewed draft — not
+        conditionally, not only when something was flagged. The rendered
+        document carries the same banner top and bottom, emitted by the
+        renderer in Python where no model output can drop it.
+        """
+        markdown = self._plan.render_markdown(
+            drafted["draft"], screening,
+            violations=drafted["violations"],
+            integrity_warnings=drafted["warnings"],
+            case_text=case_text,
+            check_ran=drafted["check_ran"],
+        )
+        path = self._plan.save_draft(markdown, screening["patient_label"])
+        if path is None:
+            self._speak_confirmation(
+                "I couldn't write that to disk, so it hasn't been saved. "
+                "Sorry — the details are in the logs."
+            )
+            self._emit_event("plan_ended", outcome="failed")
+            return
+
+        lead = (
+            "I wasn't sure what you wanted, so I've saved it rather than lose it. "
+            if unsure else ""
+        )
+        self._speak_confirmation(
+            f"{lead}It's in your treatment plans folder as "
+            f"{os.path.basename(path)}. It's a draft and hasn't been clinically "
+            "reviewed — it shouldn't go to the patient until you've been over it."
+        )
+        self._emit_event(
+            "plan_saved",
+            filename=os.path.basename(path),
+            kind="plan",
+            unsure=unsure,
+        )
+        self._emit_event("plan_ended", outcome="saved")
+
+    def _summarize_plan_for_speech(self, screening: dict, drafted: dict) -> str:
+        """
+        A short spoken account of what was drafted and what she needs to know
+        before approving it.
+
+        Leads with anything unresolved. Sanitized like any other long
+        model-derived text before it reaches Kokoro — the corpus is her own
+        committed documents rather than untrusted mail, but the stuck-TTS
+        failure mode is the same and the call is free.
+        """
+        draft = drafted["draft"]
+        parts: list[str] = []
+
+        phases = draft.get("phases") or []
+        goals = draft.get("goals_timeline") or {}
+        months = _clean(goals.get("total_months"))
+        span = f" over about {months} months" if months else ""
+        parts.append(
+            f"I've drafted {len(phases)} "
+            f"{'phase' if len(phases) == 1 else 'phases'}{span}."
+        )
+
+        for phase in phases[:3]:
+            items = [
+                _clean(s.get("product"))
+                for s in (phase.get("supplements") or [])
+                if isinstance(s, dict) and _clean(s.get("product"))
+            ]
+            if items:
+                parts.append(
+                    f"{_clean(phase.get('name')) or 'Phase'}: {_or_list(items[:4])}"
+                    + (f", and {len(items) - 4} more" if len(items) > 4 else "")
+                    + "."
+                )
+
+        if drafted["violations"]:
+            parts.append(
+                f"Heads up — {len(drafted['violations'])} contraindication "
+                f"{'warning is' if len(drafted['violations']) == 1 else 'warnings are'} "
+                "still unresolved on it, flagged at the top of the document."
+            )
+        elif not drafted["check_ran"]:
+            parts.append(
+                "I couldn't complete the contraindication check on this one, so "
+                "treat it as unchecked."
+            )
+
+        missing = screening["missing_safety_fields"]
+        if missing:
+            parts.append(
+                f"I drafted cautiously around what you didn't mention: "
+                f"{_or_list([_clean(m) for m in missing[:4]])}."
+            )
+
+        uncovered = screening["uncovered_topics"]
+        if uncovered:
+            parts.append(
+                f"Your documents don't cover {_or_list([_clean(u) for u in uncovered[:3]])}, "
+                "so that's flagged rather than guessed at."
+            )
+
+        warning_count = len(drafted["warnings"])
+        if warning_count:
+            noun = "item" if warning_count == 1 else "items"
+            parts.append(
+                f"There {'is' if warning_count == 1 else 'are'} {warning_count} "
+                f"{noun} the integrity check wants you to verify."
+            )
+
+        return sanitize_body_text(" ".join(parts))
 
     # ── Email queries ─────────────────────────────────────────────────────────
 
@@ -1938,7 +2722,22 @@ class LanaAssistant:
                     self._handle_explicit_memory(explicit_fact)
                     continue
 
-                # ── 3d. Email-related request? ─────────────────────────────────
+                # ── 3d. Treatment-plan request? ───────────────────────────────
+                # Same rationale as the memory intercept above, and ordered
+                # BEFORE the email one: EMAIL_KEYWORDS contains "draft",
+                # "send" and "read", so "draft a plan for this patient" would
+                # otherwise be claimed as an email turn. The plan gate is the
+                # narrower of the two, and its classifier is explicit that
+                # anything about email is not_plan, so an actual email request
+                # falls straight through to 3e.
+                #
+                # This short-circuit is also what keeps dictated patient cases
+                # out of self._llm.history — and therefore out of the memory
+                # extraction spawned in this method's finally block.
+                if self._maybe_handle_plan_request(text):
+                    continue
+
+                # ── 3e. Email-related request? ─────────────────────────────────
                 # Same rationale as the memory intercept above: handled
                 # entirely here, never sent to self._llm. The gate opens on
                 # an email keyword OR on live conversation context (a just-
@@ -1947,7 +2746,7 @@ class LanaAssistant:
                 if self._maybe_handle_email_query(text, email_ctx):
                     continue
 
-                # ── 3e. Get Claude's response ─────────────────────────────────
+                # ── 3f. Get Claude's response ─────────────────────────────────
                 # email_context is recomputed every turn (a cheap in-memory
                 # read of the live account store), so a just-connected account
                 # is reflected immediately — no restart, even mid-conversation.
@@ -1960,7 +2759,7 @@ class LanaAssistant:
                 )
                 self._emit_event("llm_response", text=reply)
 
-                # ── 3f. Speak the response (barge-in enabled) ─────────────────
+                # ── 3g. Speak the response (barge-in enabled) ─────────────────
                 self._set_state(AssistantState.SPEAKING)
                 self._emit_event("speaking_started")
                 logger.info(f"[Speaking] '{reply[:80]}{'…' if len(reply) > 80 else ''}'")

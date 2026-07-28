@@ -44,6 +44,19 @@ def main() -> None:
     logger.info(f"    STT    : faster-whisper ({config.WHISPER_MODEL_SIZE} / {config.WHISPER_DEVICE})")
     logger.info(f"    TTS    : Kokoro-82M ({config.TTS_VOICE})")
     logger.info(f"    Server : http://{config.SERVER_HOST}:{config.SERVER_PORT}")
+    # A one-click link with the token already in it. The dashboard stashes the
+    # token in sessionStorage and strips it from the address bar on load, so it
+    # is not left sitting in shot during a screen recording.
+    if config.LANA_API_TOKEN:
+        logger.info(
+            f"    UI     : http://{config.SERVER_HOST}:{config.SERVER_PORT}"
+            f"/ui/?token={config.LANA_API_TOKEN}"
+        )
+    else:
+        logger.warning(
+            "    UI     : unavailable — LANA_API_TOKEN is not set in .env, so "
+            "the dashboard has nothing to authenticate with."
+        )
     logger.info("─" * 50)
 
     # Start the voice pipeline automatically on launch in a background thread

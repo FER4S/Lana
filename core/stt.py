@@ -29,6 +29,17 @@ import numpy as np
 import pyaudio
 from loguru import logger
 
+# ── torch MUST load before faster_whisper (ctranslate2) ───────────────────────
+# Both bring CUDA/cuDNN into the process, and this build only survives one DLL
+# load order: torch first. If ctranslate2's CUDA libraries load first, torch
+# then NATIVELY CRASHES the process the moment Kokoro (TTS) initialises on the
+# GPU — a C++-level abort no Python try/except can catch. core/stt.py is the
+# sole importer of faster_whisper, so importing torch here, before that import,
+# guarantees torch wins the order everywhere regardless of who imports whom.
+# Verified on RTX 3060 / torch 2.5.1+cu121: reordering these re-introduces the
+# crash. (STT stays on WHISPER_DEVICE and TTS on TTS_DEVICE — both can be GPU.)
+import torch  # noqa: F401  (imported for DLL-load ordering, not used here)
+
 # ── Fix for Windows CUDA DLLs ─────────────────────────────────────────────────
 # Windows Python 3.8+ no longer uses PATH for DLL resolution. The nvidia-* pip
 # packages place their DLLs in site-packages/nvidia/*/bin. We must add them manually.

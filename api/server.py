@@ -5,22 +5,27 @@
 
 import asyncio
 import html
+import os
+import re
 import secrets
 import smtplib
 import threading
-from typing import Dict, Any, Optional, Set
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Set
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, parse_qs
 
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from imapclient.exceptions import IMAPClientError
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from core import plan_manager
 from core.assistant import LanaAssistant
 from core.email_manager import OAUTH_STATE_TTL_S
 from core.memory import is_valid_email
@@ -33,6 +38,16 @@ assistant = LanaAssistant()
 # double-poll and race the cache file; see core/email_manager.py's module
 # docstring).
 email_manager = assistant.get_email_manager()
+# Same instance the voice flow drafts with, so the corpus provenance this API
+# reports is the corpus that actually produced the drafts it serves.
+plan = assistant.get_plan_manager()
+
+# The demo dashboard (repo-root ui/). Static HTML/CSS/JS with no data in it,
+# so the mount itself is deliberately unauthenticated - every endpoint the
+# page then calls still requires the bearer token.
+_UI_DIR: str = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui"
+)
 
 # ── API token auth ────────────────────────────────────────────────────────────
 # /start, /stop and /events carry control of the assistant and the live
@@ -105,6 +120,12 @@ async def lifespan(app: FastAPI):
     # start the background event broadcaster task.
     await asyncio.to_thread(email_manager.initialize)
     email_manager.start_polling()
+    # Load the plan corpus if assistant.run() hasn't already (main.py starts it
+    # first, but /start may never be hit). Guarded rather than unconditional so
+    # the corpus is never parsed twice, and non-fatal for the same reason it is
+    # in run(): a broken corpus disables drafting, never the server.
+    if not plan.available:
+        await asyncio.to_thread(plan.load)
     task = asyncio.create_task(broadcast_events())
     yield
     # Shutdown: stop the email poller (assistant.stop() deliberately does
@@ -465,3 +486,153 @@ async def delete_email_account(account_id: str) -> Dict[str, str]:
 async def email_summary() -> Dict[str, Any]:
     """Dashboard payload: unread counts + recent subjects/senders per account."""
     return email_manager.get_summary()
+
+
+# ── Treatment plans (READ-ONLY) ──────────────────────────────────────────────
+# Three GETs, no POST/PUT/DELETE anywhere: drafts are created by the voice
+# sub-dialogue and by nothing else. core/plan_manager.py has no delivery path
+# and must never gain one - serving a draft to the local dashboard is not one,
+# but adding a write or a send endpoint here would be.
+#
+# The files are patient-adjacent, so both are behind require_token, same as
+# /email/summary. Filenames are matched against an allowlist derived from
+# PlanManager._save()/_slugify() rather than sanitized, and the resolved path
+# is then re-checked for containment: an allowlist plus a realpath check is
+# two independent reasons a traversal cannot escape the folder.
+
+_PLAN_FILENAME_RE = re.compile(
+    r"DRAFT_(?P<kind>plan|referral_memo)_(?P<slug>[a-z0-9-]{1,24})_"
+    r"(?P<stamp>\d{8}-\d{6})\.md"
+)
+
+
+def _resolve_plan_file(filename: str) -> Optional[str]:
+    """
+    Absolute path of a saved draft, or None if the name is not one we wrote.
+
+    Belt: the name must match exactly the shape _save() produces. Braces: the
+    resolved real path must still sit inside the plans directory, which also
+    catches a symlink pointed out of it.
+    """
+    if not _PLAN_FILENAME_RE.fullmatch(filename):
+        return None
+    root = os.path.realpath(plan_manager.plans_dir())
+    path = os.path.realpath(os.path.join(root, filename))
+    if not path.startswith(root + os.sep) or not os.path.isfile(path):
+        return None
+    return path
+
+
+def _list_plan_files() -> List[Dict[str, Any]]:
+    """
+    Saved drafts, newest first, described from the FILENAME ONLY - the
+    documents are never opened here. Anything in the folder that we didn't
+    write is ignored rather than listed.
+    """
+    root = plan_manager.plans_dir()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []  # folder doesn't exist yet: no drafts have ever been saved
+
+    found: List[Dict[str, Any]] = []
+    for name in names:
+        match = _PLAN_FILENAME_RE.fullmatch(name)
+        if match is None:
+            continue
+        try:
+            stamp = datetime.strptime(match.group("stamp"), "%Y%m%d-%H%M%S")
+            saved_at = stamp.replace(tzinfo=config.TIMEZONE).isoformat()
+        except ValueError:
+            continue
+        try:
+            size = os.path.getsize(os.path.join(root, name))
+        except OSError:
+            continue
+        found.append({
+            "filename": name,
+            "kind": match.group("kind"),
+            "patient_label": match.group("slug"),
+            "saved_at": saved_at,
+            "size": size,
+        })
+
+    found.sort(key=lambda item: item["filename"], reverse=True)
+    return found
+
+
+# Declared BEFORE /plans/{filename} on purpose: routes match in registration
+# order, so the path-param route would otherwise swallow "knowledge".
+@app.get("/plans/knowledge", tags=["plans"], dependencies=[Depends(require_token)])
+async def plan_knowledge() -> Dict[str, Any]:
+    """
+    Provenance for the corpus behind every draft: how many of her documents,
+    how many rules, which version, and whether she has reviewed them yet.
+
+    `reviewed` is reported as-is. It is false until Alexandra signs off on
+    safety_rules.json, and the dashboard is expected to say so - the rendered
+    document already carries the same notice.
+    """
+    knowledge = plan.knowledge
+    if not plan.available:
+        return {
+            "available": False,
+            "unavailable_reason": plan.unavailable_reason,
+        }
+    return {
+        "available": True,
+        "unavailable_reason": "",
+        "doc_count": knowledge.source_count,
+        "doc_names": list(knowledge.source_names()),
+        "rule_count": len(knowledge.all_rule_ids()),
+        "referral_rule_count": len(knowledge.referral_rule_ids()),
+        "contraindication_rule_count": len(knowledge.contraindication_rule_ids()),
+        "rules_version": knowledge.rules_version,
+        "corpus_hash": knowledge.corpus_hash(),
+        "reviewed": knowledge.rules_reviewed,
+        "review_status": knowledge.review_status,
+    }
+
+
+@app.get("/plans", tags=["plans"], dependencies=[Depends(require_token)])
+async def list_plans() -> Dict[str, Any]:
+    """Saved drafts and referral memos, newest first. Metadata only."""
+    return {"plans": await asyncio.to_thread(_list_plan_files)}
+
+
+@app.get("/plans/{filename}", tags=["plans"], dependencies=[Depends(require_token)])
+async def read_plan(filename: str) -> PlainTextResponse:
+    """
+    One saved draft, as raw markdown for the dashboard to render.
+
+    Served as text/plain, never text/html: the document contains
+    model-generated prose, and handing a browser a document it will parse as
+    HTML is the one way this endpoint could become an injection vector.
+    """
+    path = _resolve_plan_file(filename)
+    if path is None:
+        raise HTTPException(status_code=404, detail="No saved draft with that name.")
+    try:
+        markdown = await asyncio.to_thread(
+            lambda: open(path, "r", encoding="utf-8").read()
+        )
+    except OSError as exc:
+        logger.warning(f"Could not read treatment plan draft: {type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="Could not read that draft.")
+    return PlainTextResponse(markdown, media_type="text/plain; charset=utf-8")
+
+
+# ── Demo dashboard ───────────────────────────────────────────────────────────
+# Mounted last. Static assets only - no data is embedded in the page, so this
+# mount carries no token requirement; the page asks for one and presents it to
+# the endpoints above.
+
+@app.get("/", include_in_schema=False)
+async def root() -> RedirectResponse:
+    return RedirectResponse(url="/ui/")
+
+
+if os.path.isdir(_UI_DIR):
+    app.mount("/ui", StaticFiles(directory=_UI_DIR, html=True), name="ui")
+else:  # pragma: no cover - only when the repo is checked out without ui/
+    logger.warning(f"Dashboard directory not found ({_UI_DIR}) — /ui is disabled.")

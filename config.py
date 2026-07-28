@@ -27,6 +27,14 @@ WAKE_WORD_MODEL: str = os.environ.get(
 )
 # Detection confidence threshold (0.0 – 1.0)
 WAKE_WORD_THRESHOLD: float = float(os.environ.get("WAKE_WORD_THRESHOLD", "0.5"))
+# Threshold for the SECOND detector that listens while Lana is speaking, so the
+# boss can interrupt her ("barge-in"). Kept separate from and higher than the
+# idle wake threshold: a false fire here cuts her off mid-sentence. On speakers
+# (no headphones) her own voice bleeds into the mic, so if self-triggers persist
+# after the "don't say your own name" guard, raise this (e.g. 0.7–0.8) until they
+# stop while a deliberate, close "Hey Lana" still fires. Env-tunable so it can be
+# dialled in during a soak test without editing code.
+BARGE_IN_THRESHOLD: float = float(os.environ.get("BARGE_IN_THRESHOLD", "0.6"))
 
 # ── Microphone / Audio Input ──────────────────
 # Set to None to use the system default microphone.
@@ -59,6 +67,14 @@ WHISPER_LANGUAGE: str = os.environ.get("WHISPER_LANGUAGE", "en")
 TTS_VOICE: str = os.environ.get("TTS_VOICE", "af_bella")
 # Speed multiplier: 1.0 = normal, 1.1 = slightly faster (good for assistants)
 TTS_SPEED: float = float(os.environ.get("TTS_SPEED", "1.1"))
+# Device for Kokoro: "auto" (GPU if available, else CPU), "cuda", or "cpu".
+# The CPU fallback in tts.py is a Python try/except, so it only catches a
+# *catchable* GPU error — a NATIVE crash in torch/CUDA while loading the model
+# onto the GPU (e.g. a torch build that predates the installed GPU) kills the
+# process outright, before the except can run. Set TTS_DEVICE=cpu to load
+# Kokoro on the CPU from the start and sidestep that. Whisper stays on its own
+# WHISPER_DEVICE, so STT can remain on the GPU while only TTS moves to the CPU.
+TTS_DEVICE: str = os.environ.get("TTS_DEVICE", "auto").strip().lower()
 
 # ── FastAPI Server ────────────────────────────
 SERVER_HOST: str = os.environ.get("SERVER_HOST", "127.0.0.1")

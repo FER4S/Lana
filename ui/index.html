@@ -1,0 +1,167 @@
+<!doctype html>
+<!--
+  Lana — local dashboard.
+
+  Static assets only: this file contains no data and no token. It asks for a
+  token (from ?token=, then sessionStorage) and presents it to the API, which
+  is where every access decision is actually made.
+
+  No build step, no bundler, no CDN. Everything it needs is in this folder, so
+  there is nothing to install before a demo and nothing to fail live.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lana</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='11' fill='none' stroke='%232f6f62' stroke-width='3'/></svg>">
+</head>
+<body>
+
+<!-- ── Token gate ─────────────────────────────────────────────────────────── -->
+<div id="token-gate" class="gate" hidden>
+  <div class="gate-card">
+    <h1>Lana</h1>
+    <p>This dashboard needs the API token from your <code>.env</code>
+       (<code>LANA_API_TOKEN</code>).</p>
+    <form id="token-form">
+      <input id="token-input" type="password" placeholder="Paste token"
+             autocomplete="off" spellcheck="false">
+      <button type="submit">Connect</button>
+    </form>
+    <p class="gate-hint">The server prints a ready-made link with the token at
+       startup — opening that skips this step.</p>
+  </div>
+</div>
+
+<!-- ── App ────────────────────────────────────────────────────────────────── -->
+<div id="app" class="app" hidden>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-text">
+        <strong>Lana</strong>
+        <span class="brand-sub">Voice assistant · treatment plan drafting</span>
+      </span>
+    </div>
+
+    <div class="topbar-status">
+      <span id="state-pill" class="pill pill-idle">
+        <span class="pill-dot"></span><span id="state-label">Idle</span>
+      </span>
+      <span id="wake-chip" class="chip" title="Wake word detector">
+        <span class="chip-key">Wake word</span>
+        <span id="wake-value" class="chip-value">—</span>
+      </span>
+      <span id="socket-chip" class="chip" title="Event stream">
+        <span class="chip-key">Events</span>
+        <span id="socket-value" class="chip-value">connecting…</span>
+      </span>
+    </div>
+
+    <div class="topbar-actions">
+      <button id="btn-start" class="btn btn-primary">Start Lana</button>
+      <button id="btn-stop" class="btn">Stop</button>
+    </div>
+  </header>
+
+  <div id="error-bar" class="error-bar" hidden></div>
+
+  <main class="layout">
+
+    <!-- ── Presence ────────────────────────────────────────────────────── -->
+    <aside class="rail">
+      <div class="presence">
+        <div id="orb" class="orb orb-idle">
+          <span class="orb-ring"></span>
+          <span class="orb-ring"></span>
+          <span class="orb-core"></span>
+          <span class="orb-bars" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i>
+          </span>
+        </div>
+        <p id="presence-label" class="presence-label">Idle</p>
+        <p id="presence-hint" class="presence-hint">Say “Hey Lana” to begin.</p>
+      </div>
+
+      <section class="card card-grounding">
+        <h2 class="card-title">Grounded in</h2>
+        <div id="grounding-body" class="grounding-body">
+          <p class="muted">Loading corpus…</p>
+        </div>
+      </section>
+    </aside>
+
+    <!-- ── Conversation ────────────────────────────────────────────────── -->
+    <section class="transcript-wrap">
+      <div class="section-head">
+        <h2>Conversation</h2>
+        <button id="btn-clear" class="btn btn-quiet" title="Clear the transcript view">Clear</button>
+      </div>
+      <div id="transcript" class="transcript">
+        <p class="empty-state">
+          Nothing yet. Start Lana, then say <strong>“Hey Lana”</strong>.
+        </p>
+      </div>
+    </section>
+
+    <!-- ── Context ─────────────────────────────────────────────────────── -->
+    <section class="context">
+      <div class="section-head">
+        <div class="tabs" role="tablist">
+          <button id="tab-plan" class="tab tab-active" role="tab">Treatment plan</button>
+          <button id="tab-email" class="tab" role="tab">Email</button>
+        </div>
+      </div>
+
+      <!-- Plan -->
+      <div id="panel-plan" class="panel">
+        <div id="plan-empty" class="empty-state">
+          <p>No plan in progress.</p>
+          <p class="muted">Ask Lana to draft a treatment plan and this panel
+             follows the case through screening, drafting and the safety check.</p>
+          <div id="recent-plans" class="recent-plans"></div>
+        </div>
+
+        <div id="plan-live" hidden>
+          <!-- Sticky, never dismissible. Present from the moment a draft
+               exists, not only once it is saved. -->
+          <div id="draft-banner" class="draft-banner" hidden>
+            <strong>Draft — not clinician reviewed.</strong>
+            <span>Machine-generated. Must not go to a patient in this state.</span>
+          </div>
+
+          <ol id="stage-rail" class="stage-rail"></ol>
+
+          <div id="plan-body" class="plan-body"></div>
+        </div>
+      </div>
+
+      <!-- Email -->
+      <div id="panel-email" class="panel" hidden>
+        <div id="contact-request" class="contact-request" hidden>
+          <p>Lana needs an email address for
+             <strong id="contact-name">this contact</strong>.</p>
+          <form id="contact-form">
+            <input id="contact-input" type="email" placeholder="name@example.com"
+                   autocomplete="off" spellcheck="false">
+            <button type="submit">Send to Lana</button>
+          </form>
+          <p id="contact-msg" class="contact-msg"></p>
+          <p class="muted">She is also listening for it — typing is just the
+             easier way to get an address right.</p>
+        </div>
+        <div id="email-body">
+          <p class="muted">Loading accounts…</p>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="markdown.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

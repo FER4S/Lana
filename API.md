@@ -248,6 +248,46 @@ Connects and manages email accounts (Hostinger-style IMAP and Gmail via OAuth), 
   - `400 {"detail": "That doesn't look like a valid email address."}` — malformed. Checked before anything else, so a request that expires mid-flight can never be reported as a bad address.
   - `409 {"detail": "Lana isn't waiting for a contact's email address."}` — nothing pending, or the request expired.
 
+## Treatment Plan Endpoints
+
+**Read-only, all three.** Drafts are produced by the voice sub-dialogue and by nothing else — there is no endpoint that creates, edits, sends or deletes one, and `core/plan_manager.py` has no delivery path. All three require the same bearer token as `/email/*`.
+
+### 1. Corpus Provenance
+- **URL:** `GET /plans/knowledge`
+- **Description:** What the drafts are grounded in. `reviewed` is `false` until Alexandra signs off on `safety_rules.json`; surface it rather than hiding it — the rendered document carries the same notice.
+- **Example Response:**
+  ```json
+  {
+    "available": true,
+    "unavailable_reason": "",
+    "doc_count": 9,
+    "doc_names": ["01_intake.md", "04_gut_repair_5r.md"],
+    "rule_count": 76,
+    "referral_rule_count": 18,
+    "contraindication_rule_count": 58,
+    "rules_version": 1,
+    "corpus_hash": "0288c8e7fecd",
+    "reviewed": false,
+    "review_status": "PENDING — …"
+  }
+  ```
+- When the corpus failed to load, only `{"available": false, "unavailable_reason": "…"}` is returned.
+
+### 2. List Saved Drafts
+- **URL:** `GET /plans`
+- **Description:** Metadata for every saved draft and referral memo, newest first. Parsed from the filename — the documents are not opened.
+- **Example Response:**
+  ```json
+  {"plans": [{"filename": "DRAFT_plan_nadia_20260723-174826.md", "kind": "plan",
+              "patient_label": "nadia", "saved_at": "2026-07-23T17:48:26+03:00",
+              "size": 5312}]}
+  ```
+
+### 3. Read One Draft
+- **URL:** `GET /plans/{filename}`
+- **Description:** The raw markdown, as `text/plain` (never `text/html` — the document contains model-generated prose). Every draft carries the `DRAFT — PENDING ALEXANDRA'S REVIEW` banner at the top and bottom, emitted by the renderer in Python.
+- `filename` must match `DRAFT_(plan|referral_memo)_<slug>_<YYYYmmdd-HHMMSS>.md`; anything else, and anything resolving outside the plans directory, is `404`.
+
 ## WebSocket Events
 
 - **URL:** `ws://localhost:8000/events?token=<token>`
@@ -270,6 +310,22 @@ All events are broadcast as JSON objects containing an `"event"` field and any a
 | `error` | Fired when a component dies unrecoverably (currently: the wake-word microphone failed to open or died mid-stream). The same string is available via `GET /status` as `error`. | `{"event": "error", "message": "wake word detector: microphone failed to open: ..."}` |
 | `contact_email_requested` | Fired when the voice send flow needs a recipient's email address and has opened a pending request. Cue to show a text box wired to `POST /email/pending-contact`. | `{"event": "contact_email_requested", "name": "Michael"}` |
 | `contact_email_resolved` | Fired when that request ends. `source` is `"voice"` (spoken and confirmed), `"typed"` (submitted from the dashboard), or `"cancelled"` (never supplied — nothing was sent). Cue to hide the text box. | `{"event": "contact_email_resolved", "source": "typed"}` |
+
+#### Treatment-plan events
+
+Emitted by the plan sub-dialogue in `core/assistant.py`. They are **emit-only** — nothing in the backend reads them, and none of them can affect the flow. They exist because the plan flow otherwise produces only `llm_response`/`transcription`, which leaves the screening, the referral gate and the contraindication check invisible to a frontend.
+
+| Event | Description | Payload |
+|---|---|---|
+| `plan_started` | A treatment-plan request was recognised and the sub-dialogue has begun. Always the first plan event of a run. | `{"event": "plan_started", "patient_hint": "Nadia"}` (`patient_hint` may be `null`) |
+| `plan_stage` | Progress ticker. `stage` is one of `dictating`, `screening`, `drafting`, `revising`, `checking`, `confirming`. Not strictly linear — `revising`/`checking` can repeat. | `{"event": "plan_stage", "stage": "screening"}` |
+| `plan_screened` | Screening finished. `referral_flags` carry the model's `matched_because` **and** the rule's `verbatim` text, `refer_to` and `kind` resolved from the rulebook. `confidence` is `confident` or `possible` and is **presentational only** — a `possible` flag is still a referral. | `{"event": "plan_screened", "patient_label": "Nadia", "plan_type": "standard", "referral_flags": [{"rule_id": "REF-…", "confidence": "possible", "matched_because": "…", "verbatim": "…", "refer_to": "GP", "kind": "refer_out"}], "applicable_rule_ids": ["CI-…"], "missing_safety_fields": ["pregnancy status"], "uncovered_topics": ["…"]}` |
+| `plan_drafted` | A draft exists. Carries the plan's **shape only** — the document itself is fetched from `GET /plans/{filename}` once saved. Re-emitted after every revision. | `{"event": "plan_drafted", "phase_count": 2, "total_months": "3", "phases": [{"name": "Phase 1 — Remove", "duration_weeks": "6", "supplement_count": 3}]}` |
+| `plan_checked` | Post-draft contraindication check finished. **`check_ran: false` means the check itself failed — an empty `violations` list is not a clean bill of health.** `auto_cleared` is true when the automatic clearing pass ran and its re-check found strictly fewer violations. | `{"event": "plan_checked", "check_ran": true, "auto_cleared": false, "violations": [{"rule_id": "CI-…", "item": "Berberine", "phase": "Phase 1", "explanation": "…", "verbatim": "…"}]}` |
+| `plan_saved` | A file was written. `kind` distinguishes a plan from a referral memo; `unsure` is true when it was saved because the confirmation was unclear rather than because it was approved. | `{"event": "plan_saved", "filename": "DRAFT_plan_nadia_20260723-174826.md", "kind": "plan", "unsure": false}` |
+| `plan_ended` | Terminal. Exactly one per run. `outcome` is `saved`, `discarded`, `abandoned`, `failed`, or `unavailable`. | `{"event": "plan_ended", "outcome": "saved"}` |
+
+**Note — the dictated case.** Case dictation does *not* get its own event. Each spoken segment arrives as an ordinary `transcription`; `plan_stage: "dictating"` is the signal to stitch them into one block rather than render them as separate turns. No `plan_*` event carries case text.
 
 **Note — sending email:** there are no events for drafting, confirming, or sending. The whole exchange — "here's what I've got…", "should I send it?", "sent to Michael" — flows through the ordinary `llm_response` → `speaking_started` → `speaking_ended` → `listening_started` → `transcription` sequence, so a transcript view shows it with no special handling. The two `contact_email_*` events above are the only additions, and they exist solely so the dashboard can offer typing as an alternative to speaking an address.
 

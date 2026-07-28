@@ -90,8 +90,17 @@ class TTSEngine:
         Call this once at startup — model weights are downloaded automatically
         from Hugging Face on the first run and cached locally after that.
         """
-        # Detect device
-        target_device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Pick the device. config.TTS_DEVICE forces the choice; "auto" (the
+        # default) uses the GPU when torch sees one. Forcing "cpu" is the
+        # escape hatch for a machine where loading Kokoro onto CUDA crashes
+        # torch natively — an uncatchable crash the except-based fallback below
+        # cannot rescue, because the process is already gone.
+        if config.TTS_DEVICE == "cpu":
+            target_device = "cpu"
+        elif config.TTS_DEVICE == "cuda":
+            target_device = "cuda"
+        else:  # "auto" (or anything unrecognised — fail toward the old behaviour)
+            target_device = "cuda" if torch.cuda.is_available() else "cpu"
 
         logger.info(
             f"Loading Kokoro-82M on {target_device.upper()} "

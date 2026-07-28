@@ -40,6 +40,10 @@ data/
 # Local throwaway verification / scratch scripts
 scratchpad/
 
+# Local development tooling / assistant artifacts — keep local, never publish
+CLAUDE.md
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
