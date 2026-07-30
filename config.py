@@ -80,7 +80,9 @@ TTS_DEVICE: str = os.environ.get("TTS_DEVICE", "auto").strip().lower()
 SERVER_HOST: str = os.environ.get("SERVER_HOST", "127.0.0.1")
 SERVER_PORT: int = int(os.environ.get("SERVER_PORT", "8000"))
 SERVER_RELOAD: bool = os.environ.get("SERVER_RELOAD", "false").lower() == "true"
-# Shared secret the frontend must present to use /start, /stop and /events.
+# Shared secret the frontend must present to use /start, /stop, /events, and
+# every /email/* and /plans/* endpoint (all except the Gmail OAuth callback,
+# which a one-time state nonce protects instead — see api/server.py).
 # Empty = auth fails closed (all protected requests rejected). Generate one:
 #   python -c "import secrets; print(secrets.token_urlsafe(32))"
 LANA_API_TOKEN: str = os.environ.get("LANA_API_TOKEN", "")

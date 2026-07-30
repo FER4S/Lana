@@ -95,7 +95,49 @@ CONFIRM_MAX_TOKENS: int = 10
 # default for this model anyway; sending it explicitly is what keeps a future
 # default change from silently altering how hard the safety screen thinks.
 # When the SDK is bumped, move this to the typed parameter.
+#
+# ADAPTIVE IS 4.6-AND-LATER ONLY. Haiku 4.5 REJECTS {"type": "adaptive"} and
+# errors on output_config.effort outright; it needs the older
+# {"type": "enabled", "budget_tokens": N}, where N >= 1024 and N < that stage's
+# max_tokens (the tightest is CHECK_MAX_TOKENS, so 4000 is the largest budget
+# safe across all three stages). So retiering any stage to a pre-4.6 model is
+# NEVER a model swap alone — this declaration has to change with it or the call
+# 400s. That is what the constructor's `thinking=` override exists for.
 _THINKING_BODY: dict = {"thinking": {"type": "adaptive"}}
+
+# Per-stage heavy-tier models. All three default to the house background tier, so
+# nothing changes unless a caller asks — but they are named separately for two
+# reasons:
+#
+#   * EXTRACTION_MODEL_ID is SHARED with memory extraction (core/memory.py) and
+#     email reasoning (core/email_manager.py). Retiering the plan pipeline by
+#     editing that constant would silently retier those too.
+#   * The stages do not carry equal risk. check_draft is the safety net behind
+#     draft_plan, so downgrading the drafter is only defensible while the checker
+#     stays heavy. One constant cannot express that; three can.
+#
+# Changing any of these invalidates the golden-suite evidence behind it until
+# re-run — 0 referral misses (screening) and 0 contraindication escapes (check)
+# are the bar, see scratchpad/PLAN_HANDOFF.md.
+#
+# BENCHMARKED 2026-07-28 — DO NOT RE-RUN "HAIKU FOR SPEED". Measured like-for-like
+# on the golden suite with per-call instrumentation:
+#
+#     claude-sonnet-5      (adaptive)      26.8 s/call   $0.054/call   100% recall
+#     claude-haiku-4-5-... (budget 4000)   26.1 s/call   $0.017/call   100% recall
+#
+# Haiku is NOT faster — 2.6% apart, inside noise. Thinking tokens dominate the
+# wall clock and a cheaper model does not think less, so a tier downgrade does
+# nothing for the ~2-minute revision silence; the levers for latency are thinking
+# budget and corpus size, not the model. Haiku held 0 referral misses (29
+# vignettes, 1 pass) and is ~3.2x cheaper, but raised two CONFIDENT false-positive
+# referrals where Sonnet's recorded behaviour across 71 screenings was that every
+# spurious flag self-identifies as "possible" — and "confident" is the signal the
+# reviewing clinician triages on. No benefit, real regression: Sonnet stays.
+# Haiku is only worth revisiting if COST, not speed, ever becomes the driver.
+SCREEN_MODEL_ID: str = EXTRACTION_MODEL_ID
+DRAFT_MODEL_ID: str = EXTRACTION_MODEL_ID
+CHECK_MODEL_ID: str = EXTRACTION_MODEL_ID
 
 SCREEN_MAX_TOKENS: int = 8000
 SCREEN_TIMEOUT: float = 90.0
@@ -163,7 +205,15 @@ class PlanManager:
     knowledge corpus) before anything else, and check `available`.
     """
 
-    def __init__(self, knowledge: PlanKnowledge | None = None) -> None:
+    def __init__(
+        self,
+        knowledge: PlanKnowledge | None = None,
+        *,
+        screen_model: str | None = None,
+        draft_model: str | None = None,
+        check_model: str | None = None,
+        thinking: dict | None = None,
+    ) -> None:
         self._knowledge = knowledge or PlanKnowledge()
 
         # Two clients, mirroring EmailManager: a realtime one for the fast
@@ -173,6 +223,21 @@ class PlanManager:
         self._reasoning_client = anthropic.Anthropic(
             api_key=config.ANTHROPIC_API_KEY, max_retries=0
         )
+
+        # Keyword-only and defaulted, so production construction (PlanManager()
+        # in assistant.py, and every drive script) is untouched. These exist so a
+        # benchmark harness can retier ONE stage at a time without editing a
+        # module constant that other subsystems share — see the SCREEN/DRAFT/
+        # CHECK_MODEL_ID comment above. Overriding any of them means the safety
+        # evidence for that stage no longer applies until the suite is re-run.
+        self._screen_model = screen_model or SCREEN_MODEL_ID
+        self._draft_model = draft_model or DRAFT_MODEL_ID
+        self._check_model = check_model or CHECK_MODEL_ID
+        # Thinking budget, same escape-hatch shape as _THINKING_BODY (adaptive by
+        # default). A harness can pass {"thinking": {"type": "enabled",
+        # "budget_tokens": N}} to trade reasoning depth for latency — the other
+        # axis of the tier question, and equally evidence-invalidating.
+        self._thinking = thinking or _THINKING_BODY
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -346,10 +411,10 @@ class PlanManager:
 
         try:
             response = self._reasoning_client.messages.create(
-                model=EXTRACTION_MODEL_ID,
+                model=self._screen_model,
                 max_tokens=SCREEN_MAX_TOKENS,
                 timeout=SCREEN_TIMEOUT,
-                extra_body=_THINKING_BODY,
+                extra_body=self._thinking,
                 system=self._cached_system(instructions),
                 messages=[{"role": "user", "content": f"PATIENT CASE:\n{case_text}"}],
             )
@@ -581,10 +646,10 @@ class PlanManager:
             # keeps the connection active; get_final_message() still returns the
             # complete response, so nothing downstream changes.
             with self._reasoning_client.messages.stream(
-                model=EXTRACTION_MODEL_ID,
+                model=self._draft_model,
                 max_tokens=DRAFT_MAX_TOKENS,
                 timeout=DRAFT_TIMEOUT,
-                extra_body=_THINKING_BODY,
+                extra_body=self._thinking,
                 system=self._cached_system("".join(parts)),
                 messages=[{"role": "user", "content": "\n".join(user_parts)}],
             ) as stream:
@@ -644,10 +709,10 @@ class PlanManager:
 
         try:
             response = self._reasoning_client.messages.create(
-                model=EXTRACTION_MODEL_ID,
+                model=self._check_model,
                 max_tokens=CHECK_MAX_TOKENS,
                 timeout=CHECK_TIMEOUT,
-                extra_body=_THINKING_BODY,
+                extra_body=self._thinking,
                 system=self._cached_system(instructions),
                 messages=[{
                     "role": "user",
@@ -872,7 +937,10 @@ class PlanManager:
         w(f"| Generated | {now.strftime('%d %b %Y, %H:%M')} |")
         w(f"| Corpus | `{self._knowledge.corpus_hash()}` |")
         w(f"| Rules | v{self._knowledge.rules_version} |")
-        w(f"| Model | `{EXTRACTION_MODEL_ID}` |")
+        # The DRAFT model specifically — this table says how this document was
+        # produced, and the drafter is what wrote it. Identical to the old
+        # EXTRACTION_MODEL_ID output unless a caller retiered the draft stage.
+        w(f"| Model | `{self._draft_model}` |")
         w(f"| Plan type | {screening.get('plan_type', '?')} |")
         w("")
         if not self._knowledge.rules_reviewed:
