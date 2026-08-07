@@ -25,6 +25,8 @@ from imapclient.exceptions import IMAPClientError
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from api.audio_ws import register_audio_ws
+
 from core import plan_manager
 from core.assistant import LanaAssistant
 from core.email_manager import OAUTH_STATE_TTL_S
@@ -82,8 +84,27 @@ async def require_token(authorization: Optional[str] = Header(default=None)) -> 
     if not _token_matches(presented):
         raise HTTPException(status_code=401, detail="Missing or invalid API token.")
 
+
+async def optional_token(authorization: Optional[str] = Header(default=None)) -> bool:
+    """
+    Like require_token but never rejects — reports whether one was presented.
+
+    Used by /status, which must stay reachable without a token because the
+    other team's monitoring polls it, while not handing internal failure
+    detail to anyone on the open internet.
+    """
+    presented: Optional[str] = None
+    if authorization and authorization.lower().startswith("bearer "):
+        presented = authorization[len("bearer "):].strip()
+    return _token_matches(presented)
+
 # A set of active websocket connections for broadcasting
 active_websockets: Set[WebSocket] = set()
+
+
+# Sentinel pushed onto the event queue to end broadcast_events()'s blocking read.
+# Identity-compared, so it can never collide with a real event (always a dict).
+_SHUTDOWN = object()
 
 
 async def broadcast_events():
@@ -91,9 +112,16 @@ async def broadcast_events():
     q = assistant.get_event_queue()
     while True:
         try:
-            # Wait for an event in a thread so we don't block the asyncio event loop
+            # Wait for an event in a thread so we don't block the asyncio event loop.
+            # This parks a worker thread in a blocking queue.get(); task.cancel()
+            # cancels the awaitable, NOT the OS thread, so the only way out is a
+            # value arriving. The lifespan pushes _SHUTDOWN to provide one —
+            # without it the event loop hangs forever joining its executor and
+            # uvicorn.run() never returns.
             event = await asyncio.to_thread(q.get)
-            
+            if event is _SHUTDOWN:
+                break
+
             # Broadcast to all connected clients
             dead_sockets = set()
             for ws in active_websockets:
@@ -132,7 +160,16 @@ async def lifespan(app: FastAPI):
     # NOT do this - see EmailManager.stop_polling()'s docstring) and cancel
     # the broadcaster task.
     email_manager.stop_polling()
-    task.cancel()
+    # Unblock the broadcaster's queue.get() so its worker thread can exit and the
+    # loop can join the default executor. Anything already queued is broadcast
+    # first (the sentinel goes to the back), then the loop breaks. cancel() stays
+    # as a backstop for the case where the broadcaster is mid-send to a wedged
+    # socket and never reaches the next get().
+    assistant.get_event_queue().put(_SHUTDOWN)
+    try:
+        await asyncio.wait_for(task, timeout=5.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        task.cancel()
 
 
 app = FastAPI(
@@ -163,12 +200,33 @@ async def health_check() -> Dict[str, str]:
 
 
 @app.get("/status", tags=["state"])
-async def get_status() -> Dict[str, Any]:
-    """Returns the current assistant state and last component failure (if any)."""
+async def get_status(authed: bool = Depends(optional_token)) -> Dict[str, Any]:
+    """
+    Current assistant state and last component failure (if any).
+
+    Deliberately still reachable WITHOUT a token: the CRM team's monitoring
+    polls it, and breaking that to close a leak would be trading one problem
+    for another. The shape never changes, so `error is not null` remains a
+    valid alerting condition either way.
+
+    What changes is the detail. The raw string names the failing component and
+    carries the OS error verbatim ("microphone failed to open: [Errno -9996]
+    Invalid input device") — useful to an operator, free reconnaissance to
+    anyone else once this is on the open internet. So an unauthenticated caller
+    learns THAT something is wrong; a token holder learns what.
+    """
+    error = assistant.get_last_error()
+    if error is not None and not authed:
+        error = "A component has failed. Authenticate for detail."
     return {
         "running": assistant.is_active(),
         "state": assistant.get_state().value,
-        "error": assistant.get_last_error(),
+        "error": error,
+        # Whether the microphone is expected to come from a browser over
+        # /audio, or is a device on this machine. A frontend needs this to know
+        # whether offering a "talk" control makes any sense; unauthenticated
+        # because it is a deployment shape, not data.
+        "browser_audio": hasattr(getattr(assistant, "_stt", None), "attach_session"),
     }
 
 
@@ -627,9 +685,38 @@ async def read_plan(filename: str) -> PlainTextResponse:
 # mount carries no token requirement; the page asks for one and presents it to
 # the endpoints above.
 
+# The browser audio socket. Registered from its own module and given
+# _token_matches by injection, so api/audio_ws.py never imports this file back.
+# Deliberately NOT folded into /events: that socket is an external contract a
+# second team builds against, and it stays JSON-only.
+register_audio_ws(app, assistant, _token_matches)
+
+
 @app.get("/", include_in_schema=False)
 async def root() -> RedirectResponse:
     return RedirectResponse(url="/ui/")
+
+
+@app.middleware("http")
+async def _no_stale_dashboard(request, call_next):
+    """
+    Make browsers revalidate the dashboard instead of trusting their cache.
+
+    Found the hard way: after editing ui/app.js the browser kept serving a
+    33 KB cached copy of a 38 KB file, so a newly added control simply never
+    appeared and nothing in the console said why. On a deployed box that is
+    worse — Alexandra opens Lana after an update and silently gets yesterday's
+    dashboard, with a token flow or an event name that no longer matches the
+    backend.
+
+    `no-cache` is revalidate-per-request, NOT no-store: the ETag still short-
+    circuits the body, so this costs a 304 and nothing more. Scoped to /ui
+    because the API responses are already uncached.
+    """
+    response = await call_next(request)
+    if request.url.path.startswith("/ui"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
 
 
 if os.path.isdir(_UI_DIR):

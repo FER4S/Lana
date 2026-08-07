@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────
+#  Lana – local GPU speech pipeline (Windows workstation)
+#
+#  Install AFTER requirements.txt:
+#      pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#      pip install -r requirements.txt
+#      pip install -r requirements-local.txt
+#
+#  torch must be installed FIRST and from the CUDA index. It is not pinned here
+#  because the correct wheel depends on the machine's CUDA version, and pip
+#  would otherwise silently fetch the CPU build.
+#
+#  Load-order warning, the hard way (see core/stt.py): torch must be imported
+#  before ctranslate2. Kokoro (torch) and Whisper (faster-whisper ->
+#  ctranslate2) both pull CUDA into one process, and only that order survives —
+#  the other way round, torch natively crashes the process the moment Kokoro
+#  initialises on the GPU, with no traceback and no chance for the CPU-fallback
+#  except to run.
+#
+#  Set STT_PROVIDER=local and TTS_PROVIDER=local to actually use these.
+# ─────────────────────────────────────────────
+
+# ── Wake Word Detection ──
+openwakeword==0.6.0         # runs on onnxruntime, CPU only, by design
+
+# ── Speech-to-Text (GPU-accelerated via CUDA) ──
+faster-whisper==1.1.0
+nvidia-cublas-cu12==12.9.2.10    # cuBLAS DLLs needed by faster-whisper on Windows
+nvidia-cudnn-cu12==9.23.2.1      # cuDNN DLLs needed by faster-whisper on Windows
+
+# ── Text-to-Speech (local GPU, Kokoro-82M) ──
+kokoro>=0.9.4               # local TTS model
+
+# ── Audio I/O (binds PortAudio — needs real audio devices) ──
+sounddevice==0.5.1          # plays numpy audio arrays directly to speaker
+pyaudio==0.2.14             # low-level mic capture (wake word detector + STT)

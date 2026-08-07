@@ -55,9 +55,17 @@ from core.plan_manager import (
     REFERRAL_DRAFT,
     PlanManager,
 )
-from core.stt import STTEngine
-from core.tts import TTSEngine
-from core.wake_word import WakeWordDetector
+# The local engines are NOT imported here. core/stt.py pulls torch +
+# faster_whisper (and a Windows-only CUDA DLL shim), core/tts.py pulls kokoro +
+# sounddevice, and core/wake_word.py opens PyAudio — none of which may even
+# import on a headless GPU-less server. core/voice/engines.py imports whichever
+# set is actually selected, lazily, and returns objects with these exact same
+# interfaces. Nothing below this line changes as a result.
+from core.voice.engines import (
+    build_stt_engine,
+    build_tts_engine,
+    build_wake_detector,
+)
 import config
 
 # ── Tuning constants ──────────────────────────────────────────────────────────
@@ -316,20 +324,11 @@ class LanaAssistant:
         # ── Instantiate all engines ───────────────────────────────────────────
         logger.info("Initialising Lana engines…")
 
-        self._stt = STTEngine(
-            model_size=config.WHISPER_MODEL_SIZE,
-            device=config.WHISPER_DEVICE,
-            compute_type=config.WHISPER_COMPUTE_TYPE,
-            language=config.WHISPER_LANGUAGE,
-            mic_device_index=config.MIC_DEVICE_INDEX,
-        )
+        self._stt = build_stt_engine()
 
         self._llm = LLMEngine()
 
-        self._tts = TTSEngine(
-            voice=config.TTS_VOICE,
-            speed=config.TTS_SPEED,
-        )
+        self._tts = build_tts_engine()
 
         self._memory = MemoryManager()
 
@@ -349,7 +348,7 @@ class LanaAssistant:
         # loop when consumed - lets the loop tell "woken by a wake word" apart
         # from "woken by a new-mail poke" without racing _wake_event itself.
         self._wake_word_pending = False
-        self._detector = WakeWordDetector(
+        self._detector = build_wake_detector(
             callback=self._on_wake_word,
             model_name=config.WAKE_WORD_MODEL,
             threshold=config.WAKE_WORD_THRESHOLD,
@@ -363,7 +362,7 @@ class LanaAssistant:
         # _wake_word_pending, or it would queue a phantom extra conversation. It
         # shares the same wake model but uses a higher threshold, and its
         # failures are logged, not surfaced as the pipeline "deaf" error.
-        self._barge_detector = WakeWordDetector(
+        self._barge_detector = build_wake_detector(
             callback=self._on_barge_in,
             model_name=config.WAKE_WORD_MODEL,
             threshold=BARGE_IN_THRESHOLD,

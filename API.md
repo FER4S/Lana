@@ -20,6 +20,7 @@ if you discover it late.
 - [REST: email](#rest-email)
 - [REST: treatment plans](#rest-treatment-plans)
 - [WebSocket: `/events`](#websocket-events)
+- [WebSocket: `/audio`](#websocket-audio)
 - [React integration](#react-integration)
 - [What this API cannot do](#what-this-api-cannot-do)
 
@@ -241,14 +242,27 @@ Liveness probe. No token required. The body is fixed:
 Pipeline state. No token required.
 
 ```json
-{"running": true, "state": "idle", "error": null}
+{"running": true, "state": "idle", "error": null, "browser_audio": true}
 ```
 
 | Field | Notes |
 |---|---|
 | `running` | `true` for the *entire* pipeline lifetime — from the moment startup begins (loading speech models, which takes seconds) until shutdown fully completes. Not "is listening right now". |
 | `state` | Exactly one of `idle`, `listening`, `thinking`, `speaking`. |
-| `error` | `null` when healthy. Otherwise a short human-readable reason a component died unrecoverably — currently only the wake-word microphone failing to open or dying mid-stream. The process is still up, but Lana cannot hear her wake word until it is fixed. Clears automatically when the detector next starts successfully. The same string arrives on the socket as an [`error`](#event-reference) event. |
+| `browser_audio` | `true` when the backend expects the microphone to arrive from a browser over [`/audio`](#websocket-audio); `false` when speech runs on the backend's own machine. A frontend should only offer a "talk" control when this is `true` — otherwise the control would do nothing. |
+| `error` | `null` when healthy. Otherwise a short human-readable reason a component died unrecoverably. The process is still up, but Lana cannot hear until it is fixed. Clears automatically when the component next starts successfully. The same string arrives on the socket as an [`error`](#event-reference) event. **The detail depends on authentication — see below.** |
+
+**`/status` needs no token, and never will** — it is a monitoring endpoint and
+polling it should not require a credential. The response shape is identical
+either way, so `error !== null` is a valid alerting condition with or without
+one.
+
+What differs is the detail in `error`. Authenticated callers get the real
+string, which names the failing component and includes the underlying OS error.
+Unauthenticated callers get `"A component has failed. Authenticate for detail."`
+— enough to alert on, not enough to be useful reconnaissance now that this is
+reachable from the internet. If your monitoring wants the specifics, send the
+bearer token; if it only needs up/down, it does not have to change.
 
 Because `running` covers startup, a `POST /start` sent immediately after a
 `POST /stop` may report `already running` while the previous run winds down. Poll
@@ -719,6 +733,89 @@ way to tell: that `llm_response` has **no preceding `wake_word_detected`**. Poll
 
 ---
 
+## WebSocket: `/audio`
+
+**You almost certainly do not need this socket.** It carries Lana's microphone
+and speaker between a browser and the backend, and the page that owns it is
+Lana's own `/ui`. It is documented because it is part of the surface, not
+because integrating against it is expected. If you embed `/ui`, this is handled
+for you.
+
+```
+wss://<host>/audio?token=<token>
+```
+
+Same token as `/events`. Rejection happens before the handshake completes, so —
+exactly as on `/events` — the browser observes close code **1006**, never
+whatever code the server passed. Treat 1006 on `/audio` as "rejected", not as a
+network blip, and do not reconnect in a loop.
+
+**Only one audio session may exist at a time.** The backend holds a single
+assistant: one conversation history, one state machine. A second connection is
+refused with a `busy` control frame and close code `4001` rather than being
+allowed to quietly corrupt the first one's turn.
+
+### Two channels, one socket
+
+WebSocket already distinguishes text frames from binary ones, so there is no
+framing of our own:
+
+| Frame type | Carries |
+|---|---|
+| **binary** | Raw PCM audio, signed 16-bit little-endian, mono |
+| **text** | JSON control messages, `{"type": "...", ...}` |
+
+Uplink audio is 16 kHz. Downlink audio carries its rate in `speak_begin` — it
+is a property of the configured speech provider and must not be assumed.
+
+### Control messages
+
+Client → server:
+
+| `type` | Meaning |
+|---|---|
+| `hello` | Sent once on connect. `{"sample_rate": <int>}` — the real capture rate. |
+| `start_turn` | The user gestured to begin speaking. |
+| `end_turn` | The client's own endpointing decided speech finished. |
+| `playback_finished` | The playback buffer drained; the utterance was heard in full. |
+| `playback_aborted` | Queued audio was dropped — the user talked over Lana. |
+
+Server → client:
+
+| `type` | Meaning |
+|---|---|
+| `listen_start` | Begin capturing and streaming microphone frames. |
+| `listen_stop` | Stop capturing; the turn is over. |
+| `speak_begin` | Audio follows. `{"sample_rate": <int>}` |
+| `speak_end` | No more audio; play out the buffer, then send `playback_finished`. |
+| `flush` | Drop every queued sample **now**. This is barge-in. |
+| `error` | `{"message": "..."}` — never contains provider detail. |
+| `busy` | Another session holds the assistant; the socket is closing. |
+
+### Two things a client must get right
+
+**`playback_finished` is not optional.** It is the only way the backend learns
+that an utterance was actually heard. Without it, Lana cannot tell a completed
+reply from an interrupted one, and interrupted replies are recorded differently
+in the conversation history. A client that never sends it will have every reply
+eventually treated as lost.
+
+**Playback must be flushable within ~100 ms.** `flush` has to drop queued audio
+immediately, which rules out `<audio>` elements, `MediaSource`, and blob URLs.
+Use an `AudioWorklet` ring buffer you can zero directly. This is why the
+downlink is raw PCM rather than MP3 — a decode step cannot be flushed promptly.
+
+### Microphone access requires a secure context
+
+`getUserMedia` and `AudioWorklet` both require HTTPS. `http://localhost` and
+`127.0.0.1` count as secure contexts, so local development needs no
+certificate, but any other host does. If Lana is embedded in an iframe, that
+iframe needs `allow="microphone"` **and** Lana's responses must carry a
+`Permissions-Policy` header delegating `microphone` to the embedding origin.
+Miss either and the microphone fails silently, with no console error.
+
+---
+
 ## React integration
 
 ### A fetch helper
@@ -951,3 +1048,100 @@ cannot be attributed to a caller.
 HTTP. It carries patient treatment drafts and mailbox contents, so it must not be
 exposed on a network without first addressing transport security and per-client
 credentials with the operator.
+
+---
+
+## Announced changes — not yet live
+
+> Everything above this line describes the API **as it is today** and is accurate
+> as of 2026-08-05. This section is advance warning only. Nothing here is
+> implemented yet, and nothing here should be coded against until it ships and
+> this notice is replaced with a real specification.
+
+v1 moves Lana off the clinician's Windows PC onto a hosted Linux server, with the
+microphone in a browser tab rather than on the machine running the models. That
+invalidates several statements above. In rough order of impact on a consumer:
+
+**1. Loopback-only stops being true.** The two "loopback only" statements — under
+[Base URL and schema](#base-url-and-schema) and directly above — will be replaced.
+Lana will be reachable over `https://` and `wss://` at a hosted origin, behind a
+reverse proxy that terminates TLS. Plain `http://` will not be offered: browsers
+refuse microphone access outside a secure context, so TLS is a functional
+requirement here, not a hardening step.
+
+**2. One shared credential becomes per-client tokens.** The "One shared
+credential" limitation above is being fixed rather than documented. Each consumer
+gets its own named token so one can be revoked or rotated without an outage for
+the other, and so requests can be attributed. **Expect to be issued a new token
+and to stop using the shared one.**
+
+**3. The WebSocket token moves out of the query string.** `?token=` on `/events`
+lands in reverse-proxy and uvicorn access logs and in browser history, which
+makes a log file a credential store. It will be replaced by a short-lived,
+single-use ticket obtained from an authenticated REST call. The existing
+`?token=` form will keep working during the transition; a removal date will be
+announced here before it is withdrawn.
+
+**4. Tokens gain scopes, and `/plans/*` becomes a scoped permission.** Today any
+token holder can read every treatment draft, and `GET /plans` has no pagination.
+Tokens will carry explicit scopes (`plans:read`, `events:subscribe`, …) rather
+than granting everything.
+
+For **v1** the CRM's token will not carry `plans:read`, because nothing on your
+side fetches `/plans` unattended — your import path is a manual clinician copy.
+Confirmed, so this breaks nothing today.
+
+You have since said that the **first production version** needs read access to
+treatment plans, conversation history, and Lana's activity generally. That is
+understood and the scope model is being built to accommodate it rather than
+block it. Three things to settle before it can be switched on, none of them
+code problems:
+
+- **Conversation history does not currently exist as data.** Lana resets the
+  language-model history every conversation, and `/events` is a live broadcast
+  with no buffer and no replay (see above). Serving "chat" means building a
+  transcript store that has never existed — not exposing something already
+  saved. Treat it as new work with its own timeline, not a permission flag.
+- **That store would hold clinical conversation content at rest.** Your
+  `docs/SECURITY.md` applies AES-256-GCM to PHI columns; Lana currently writes
+  treatment drafts as plaintext markdown. Encryption at rest for both needs
+  agreeing before transcripts exist, not after.
+- **This is a data-protection decision, not an API one.** The clinician is the
+  data controller. Patient clinical content reaching a second organisation's
+  systems needs her explicit agreement and probably a written data-processing
+  arrangement. Please raise it on your side too — we would rather solve it
+  once, early.
+
+**Tell us what you actually need to display**, screen by screen. "Everything"
+is not something a scope can be written against, and the narrowest workable
+answer is the one that ships soonest.
+
+**5. CORS stops being wildcard.** `allow_origins=["*"]` becomes an explicit
+allowlist, and the WebSocket handshakes gain an `Origin` check (CORS does not
+cover WebSockets). **Send the exact production and staging origins** — a missing
+origin is a hard failure, not a degraded mode.
+
+**6. `/docs`, `/redoc` and `/openapi.json` will be disabled in production.**
+They are unauthenticated today and publish the whole route surface. Generate any
+client you need from the current schema and keep it; do not expect the endpoint
+to be reachable on the deployed instance.
+
+**7. A new binary WebSocket, `/audio`, will carry speech.** It is additive:
+`/events` keeps its exact current shape and stays JSON-only, so an existing
+consumer needs no change. `/audio` carries PCM frames plus a small control
+protocol and is intended for Lana's own browser client. It will be documented
+properly when it stabilises.
+
+**8. The wake word is retired from the server.** `wake_word_detected` will stop
+being emitted for browser sessions — a turn starts from an explicit user gesture
+instead. The event name is retained in the table above for the local build. Do
+not treat it as a required precondition for a conversation starting.
+
+**9. `GET /status`'s `error` becomes less chatty.** It currently returns an
+internal error string without authentication. It will be reduced, or
+authenticated. If you rely on `/health` or `/status` for infrastructure
+health-checking, **tell us which one and what you expect**, before it changes.
+
+Two things that are explicitly *not* changing: the event names and payload shapes
+in [Event reference](#event-reference), and the fact that no endpoint sends email
+or writes a treatment plan.

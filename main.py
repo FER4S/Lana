@@ -44,13 +44,21 @@ def main() -> None:
     logger.info(f"    STT    : faster-whisper ({config.WHISPER_MODEL_SIZE} / {config.WHISPER_DEVICE})")
     logger.info(f"    TTS    : Kokoro-82M ({config.TTS_VOICE})")
     logger.info(f"    Server : http://{config.SERVER_HOST}:{config.SERVER_PORT}")
-    # A one-click link with the token already in it. The dashboard stashes the
-    # token in sessionStorage and strips it from the address bar on load, so it
-    # is not left sitting in shot during a screen recording.
-    if config.LANA_API_TOKEN:
+    # The token is NEVER logged unless LANA_LOG_TOKEN_LINK is explicitly true.
+    # configure_logger() installs the LOG_FILE sink above this line, so anything
+    # printed here lands on disk with 7-day zipped retention (and in journald
+    # under systemd) — a log file that contains the API token is a credential
+    # store. The one-click link is a local-demo convenience only.
+    if config.LANA_API_TOKEN and config.LOG_TOKEN_LINK:
         logger.info(
             f"    UI     : http://{config.SERVER_HOST}:{config.SERVER_PORT}"
             f"/ui/?token={config.LANA_API_TOKEN}"
+        )
+    elif config.LANA_API_TOKEN:
+        logger.info(
+            f"    UI     : http://{config.SERVER_HOST}:{config.SERVER_PORT}/ui/"
+            "  (paste the token into the dashboard's gate; set "
+            "LANA_LOG_TOKEN_LINK=true for a one-click link on a trusted machine)"
         )
     else:
         logger.warning(

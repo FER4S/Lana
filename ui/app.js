@@ -873,6 +873,16 @@
       $("wake-value").textContent = status.running ? "armed" : "asleep";
       $("btn-start").disabled = status.running;
       $("btn-stop").disabled = !status.running;
+      // Only offer the microphone when the backend actually expects one from
+      // the browser. With local engines the mic is on the server machine, and
+      // a button that silently does nothing is worse than no button.
+      if (status.browser_audio) {
+        $("btn-mic").hidden = false;
+        if (!audio) setMicLabel("Enable microphone", false);
+        $("presence-hint").textContent = micReady
+          ? "Click “Talk to Lana”, then speak."
+          : "Click “Enable microphone” to start.";
+      }
       if (status.error) showError(status.error);
       // Events are more timely; only correct from polling when none has
       // arrived recently, so the UI never stutters between the two.
@@ -919,6 +929,79 @@
     token = value;
     sessionStorage.setItem(STORE_KEY, token);
     location.reload();
+  });
+
+  /* ── Browser microphone ───────────────────────────────────────────────── */
+  /*
+     Only wired up when the backend is running hosted speech providers. With
+     local engines the microphone is on the server machine and there is nothing
+     for the browser to capture, so the button stays hidden rather than
+     offering something that silently does nothing.
+
+     The first click does double duty: it starts a turn AND satisfies the
+     browser's autoplay policy, which blocks all audio output until the user
+     has interacted with the page. That click is unavoidable — it would still
+     be needed with a wake word.
+  */
+  let audio = null;
+  let micReady = false;
+
+  function setMicLabel(text, busy) {
+    const btn = $("btn-mic");
+    btn.textContent = text;
+    btn.disabled = !!busy;
+  }
+
+  function onAudioState(state) {
+    switch (state) {
+      case "connected":
+        micReady = true;
+        setMicLabel("Talk to Lana", false);
+        break;
+      case "listening":
+        setMicLabel("Listening…", true);
+        break;
+      case "thinking":
+        setMicLabel("Thinking…", true);
+        break;
+      case "speaking":
+        setMicLabel("Speaking — talk to interrupt", true);
+        break;
+      case "interrupted":
+      case "spoken":
+        setMicLabel("Talk to Lana", false);
+        break;
+      case "disconnected":
+        micReady = false;
+        setMicLabel("Enable microphone", false);
+        break;
+    }
+  }
+
+  function enableMic() {
+    if (!window.LanaAudio) return;
+    setMicLabel("Connecting…", true);
+    audio = new window.LanaAudio({
+      onstate: onAudioState,
+      onerror: function (message) {
+        showError(message);
+        setMicLabel("Enable microphone", false);
+      },
+    });
+    audio.connect(token).catch(function (err) {
+      showError(
+        "Microphone unavailable: " +
+          (err && err.message ? err.message : "permission denied") +
+          ". Voice needs HTTPS (or localhost) and microphone permission."
+      );
+      setMicLabel("Enable microphone", false);
+      audio = null;
+    });
+  }
+
+  $("btn-mic").addEventListener("click", function () {
+    if (!audio || !micReady) enableMic();
+    else audio.startTurn();
   });
 
   $("btn-start").addEventListener("click", function () {

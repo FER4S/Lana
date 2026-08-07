@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────
+#  Lana – hosted speech (Linux server, no GPU, no sound card)
+#
+#  Install AFTER requirements.txt:
+#      pip install -r requirements.txt
+#      pip install -r requirements-server.txt
+#
+#  Notably ABSENT, and that is the point: torch, faster-whisper, ctranslate2,
+#  kokoro, openwakeword, onnxruntime, sounddevice, pyaudio, and the nvidia-*
+#  wheels. None of them can work on this host — PortAudio has no audio devices
+#  to bind, the CUDA wheels have no GPU, and core/stt.py's DLL shim calls
+#  os.add_dll_directory, which does not exist outside Windows.
+#
+#  core/voice/engines.py imports the local engines lazily, so selecting hosted
+#  providers means they are never imported. scratchpad/headless_import_drive.py
+#  asserts exactly that by inspecting sys.modules in a subprocess.
+#
+#  REQUIRED in the server's .env (they default to "local"):
+#      STT_PROVIDER=deepgram
+#      TTS_PROVIDER=cartesia
+#      LANA_ACCOUNT_KEY=...    # DPAPI has no Linux equivalent
+# ─────────────────────────────────────────────
+
+# ── Speech providers ──
+# Both adapters use urllib from the standard library rather than a vendor SDK:
+# a handful of HTTP calls does not justify another transport stack on a box
+# whose whole purpose is being small. See core/voice/stt_provider.py.
+
+# ── Streaming audio transport (browser <-> server) ──
+websockets==14.1            # binary PCM frames on /audio, and provider sockets

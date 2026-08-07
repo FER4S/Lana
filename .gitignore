@@ -5,6 +5,12 @@
 
 # Secrets — never commit
 .env
+# Backups/variants of .env hold the same live keys. Bare ".env" does not match
+# ".env.bak.20260805-131808" or ".env.local", so they would sit stageable in the
+# repo root and land in a commit via `git add -A`. ".env.example" is the one
+# variant that must stay tracked — it carries names and comments, never values.
+.env.*
+!.env.example
 
 # Python
 __pycache__/

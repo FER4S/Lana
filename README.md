@@ -59,8 +59,9 @@ python -m venv .venv
 # 3. Install PyTorch with CUDA support FIRST (~3GB download)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# 4. Install remaining dependencies
+# 4. Install shared dependencies, then the local GPU speech pipeline
 pip install -r requirements.txt
+pip install -r requirements-local.txt
 
 # 5. Configure secrets
 copy .env.example .env
@@ -103,7 +104,9 @@ Lana/
 ├── main.py           # Entry point — starts the voice pipeline + FastAPI server
 ├── config.py         # Centralised settings (loaded from .env)
 ├── profile.json      # Static boss-profile seed (name, clinic, role, ...) — committed, edit to update
-├── requirements.txt  # Python dependencies
+├── requirements.txt        # shared dependencies, needed everywhere
+├── requirements-local.txt  # GPU speech pipeline (Windows workstation)
+├── requirements-server.txt # hosted speech (Linux, no GPU, browser mic)
 ├── .env.example      # Template for required environment variables
 ├── API.md            # REST + WebSocket contract (read this if you're on the frontend)
 ├── CLAUDE.md         # Architecture & conventions (read this if you're changing the backend)
